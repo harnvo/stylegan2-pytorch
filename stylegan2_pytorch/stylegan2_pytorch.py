@@ -1,410 +1,93 @@
-import os
-import sys
-import math
-import fire
-import json
-
-from tqdm import tqdm
-from math import floor, log2
-from random import random
-from shutil import rmtree
-from functools import partial
-import multiprocessing
-from contextlib import contextmanager, ExitStack
-
-import numpy as np
-
-import torch
-from torch import nn, einsum
-from torch.utils import data
-from torch.optim import Adam
-import torch.nn.functional as F
-from torch.autograd import grad as torch_grad
-from torch.utils.data.distributed import DistributedSampler
-from torch.nn.parallel import DistributedDataParallel as DDP
-
-from einops import rearrange, repeat
-from kornia.filters import filter2d
-
-import torchvision
-from torchvision import transforms
-from stylegan2_pytorch.version import __version__
-from stylegan2_pytorch.diff_augment import DiffAugment
-
-from vector_quantize_pytorch import VectorQuantize
-
-from PIL import Image
-from pathlib import Path
-
-try:
-    from apex import amp
-    APEX_AVAILABLE = True
-except:
-    APEX_AVAILABLE = False
-
-import aim
-
-assert torch.cuda.is_available(), 'You need to have an Nvidia GPU with CUDA installed.'
-
-
-# constants
-
-NUM_CORES = multiprocessing.cpu_count()
-EXTS = ['jpg', 'jpeg', 'png']
-
-# helper classes
-
-class NanException(Exception):
-    pass
-
-class EMA():
-    def __init__(self, beta):
-        super().__init__()
-        self.beta = beta
-    def update_average(self, old, new):
-        if not exists(old):
-            return new
-        return old * self.beta + (1 - self.beta) * new
-
-class Flatten(nn.Module):
-    def forward(self, x):
-        return x.reshape(x.shape[0], -1)
-
-class RandomApply(nn.Module):
-    def __init__(self, prob, fn, fn_else = lambda x: x):
-        super().__init__()
-        self.fn = fn
-        self.fn_else = fn_else
-        self.prob = prob
-    def forward(self, x):
-        fn = self.fn if random() < self.prob else self.fn_else
-        return fn(x)
-
-class Residual(nn.Module):
-    def __init__(self, fn):
-        super().__init__()
-        self.fn = fn
-    def forward(self, x):
-        return self.fn(x) + x
-
-class ChanNorm(nn.Module):
-    def __init__(self, dim, eps = 1e-5):
-        super().__init__()
-        self.eps = eps
-        self.g = nn.Parameter(torch.ones(1, dim, 1, 1))
-        self.b = nn.Parameter(torch.zeros(1, dim, 1, 1))
-
-    def forward(self, x):
-        var = torch.var(x, dim = 1, unbiased = False, keepdim = True)
-        mean = torch.mean(x, dim = 1, keepdim = True)
-        return (x - mean) / (var + self.eps).sqrt() * self.g + self.b
-
-class PreNorm(nn.Module):
-    def __init__(self, dim, fn):
-        super().__init__()
-        self.fn = fn
-        self.norm = ChanNorm(dim)
-
-    def forward(self, x):
-        return self.fn(self.norm(x))
-
-class PermuteToFrom(nn.Module):
-    def __init__(self, fn):
-        super().__init__()
-        self.fn = fn
-    def forward(self, x):
-        x = x.permute(0, 2, 3, 1)
-        out, *_, loss = self.fn(x)
-        out = out.permute(0, 3, 1, 2)
-        return out, loss
-
-class Blur(nn.Module):
-    def __init__(self):
-        super().__init__()
-        f = torch.Tensor([1, 2, 1])
-        self.register_buffer('f', f)
-    def forward(self, x):
-        f = self.f
-        f = f[None, None, :] * f [None, :, None]
-        return filter2d(x, f, normalized=True)
-
-# attention
-
-class DepthWiseConv2d(nn.Module):
-    def __init__(self, dim_in, dim_out, kernel_size, padding = 0, stride = 1, bias = True):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv2d(dim_in, dim_in, kernel_size = kernel_size, padding = padding, groups = dim_in, stride = stride, bias = bias),
-            nn.Conv2d(dim_in, dim_out, kernel_size = 1, bias = bias)
-        )
-    def forward(self, x):
-        return self.net(x)
-
-class LinearAttention(nn.Module):
-    def __init__(self, dim, dim_head = 64, heads = 8):
-        super().__init__()
-        self.scale = dim_head ** -0.5
-        self.heads = heads
-        inner_dim = dim_head * heads
-
-        self.nonlin = nn.GELU()
-        self.to_q = nn.Conv2d(dim, inner_dim, 1, bias = False)
-        self.to_kv = DepthWiseConv2d(dim, inner_dim * 2, 3, padding = 1, bias = False)
-        self.to_out = nn.Conv2d(inner_dim, dim, 1)
-
-    def forward(self, fmap):
-        h, x, y = self.heads, *fmap.shape[-2:]
-        q, k, v = (self.to_q(fmap), *self.to_kv(fmap).chunk(2, dim = 1))
-        q, k, v = map(lambda t: rearrange(t, 'b (h c) x y -> (b h) (x y) c', h = h), (q, k, v))
-
-        q = q.softmax(dim = -1)
-        k = k.softmax(dim = -2)
-
-        q = q * self.scale
-
-        context = einsum('b n d, b n e -> b d e', k, v)
-        out = einsum('b n d, b d e -> b n e', q, context)
-        out = rearrange(out, '(b h) (x y) d -> b (h d) x y', h = h, x = x, y = y)
-
-        out = self.nonlin(out)
-        return self.to_out(out)
-
-# one layer of self-attention and feedforward, for images
-
-attn_and_ff = lambda chan: nn.Sequential(*[
-    Residual(PreNorm(chan, LinearAttention(chan))),
-    Residual(PreNorm(chan, nn.Sequential(nn.Conv2d(chan, chan * 2, 1), leaky_relu(), nn.Conv2d(chan * 2, chan, 1))))
-])
-
-# helpers
-
-def exists(val):
-    return val is not None
-
-@contextmanager
-def null_context():
-    yield
-
-def combine_contexts(contexts):
-    @contextmanager
-    def multi_contexts():
-        with ExitStack() as stack:
-            yield [stack.enter_context(ctx()) for ctx in contexts]
-    return multi_contexts
-
-def default(value, d):
-    return value if exists(value) else d
-
-def cycle(iterable):
-    while True:
-        for i in iterable:
-            yield i
-
-def cast_list(el):
-    return el if isinstance(el, list) else [el]
-
-def is_empty(t):
-    if isinstance(t, torch.Tensor):
-        return t.nelement() == 0
-    return not exists(t)
-
-def raise_if_nan(t):
-    if torch.isnan(t):
-        raise NanException
-
-def gradient_accumulate_contexts(gradient_accumulate_every, is_ddp, ddps):
-    if is_ddp:
-        num_no_syncs = gradient_accumulate_every - 1
-        head = [combine_contexts(map(lambda ddp: ddp.no_sync, ddps))] * num_no_syncs
-        tail = [null_context]
-        contexts =  head + tail
-    else:
-        contexts = [null_context] * gradient_accumulate_every
-
-    for context in contexts:
-        with context():
-            yield
-
-def loss_backwards(fp16, loss, optimizer, loss_id, **kwargs):
-    if fp16:
-        with amp.scale_loss(loss, optimizer, loss_id) as scaled_loss:
-            scaled_loss.backward(**kwargs)
-    else:
-        loss.backward(**kwargs)
-
-def gradient_penalty(images, output, weight = 10):
-    batch_size = images.shape[0]
-    gradients = torch_grad(outputs=output, inputs=images,
-                           grad_outputs=torch.ones(output.size(), device=images.device),
-                           create_graph=True, retain_graph=True, only_inputs=True)[0]
-
-    gradients = gradients.reshape(batch_size, -1)
-    return weight * ((gradients.norm(2, dim=1) - 1) ** 2).mean()
-
-def calc_pl_lengths(styles, images):
-    device = images.device
-    num_pixels = images.shape[2] * images.shape[3]
-    pl_noise = torch.randn(images.shape, device=device) / math.sqrt(num_pixels)
-    outputs = (images * pl_noise).sum()
-
-    pl_grads = torch_grad(outputs=outputs, inputs=styles,
-                          grad_outputs=torch.ones(outputs.shape, device=device),
-                          create_graph=True, retain_graph=True, only_inputs=True)[0]
-
-    return (pl_grads ** 2).sum(dim=2).mean(dim=1).sqrt()
-
-def noise(n, latent_dim, device):
-    return torch.randn(n, latent_dim).cuda(device)
-
-def noise_list(n, layers, latent_dim, device):
-    return [(noise(n, latent_dim, device), layers)]
-
-def mixed_list(n, layers, latent_dim, device):
-    tt = int(torch.rand(()).numpy() * layers)
-    return noise_list(n, tt, latent_dim, device) + noise_list(n, layers - tt, latent_dim, device)
-
-def latent_to_w(style_vectorizer, latent_descr):
-    return [(style_vectorizer(z), num_layers) for z, num_layers in latent_descr]
-
-def image_noise(n, im_size, device):
-    return torch.FloatTensor(n, im_size, im_size, 1).uniform_(0., 1.).cuda(device)
-
-def leaky_relu(p=0.2):
-    return nn.LeakyReLU(p, inplace=True)
-
-def evaluate_in_chunks(max_batch_size, model, *args):
-    split_args = list(zip(*list(map(lambda x: x.split(max_batch_size, dim=0), args))))
-    chunked_outputs = [model(*i) for i in split_args]
-    if len(chunked_outputs) == 1:
-        return chunked_outputs[0]
-    return torch.cat(chunked_outputs, dim=0)
-
-def styles_def_to_tensor(styles_def):
-    return torch.cat([t[:, None, :].expand(-1, n, -1) for t, n in styles_def], dim=1)
-
-def set_requires_grad(model, bool):
-    for p in model.parameters():
-        p.requires_grad = bool
-
-def slerp(val, low, high):
-    low_norm = low / torch.norm(low, dim=1, keepdim=True)
-    high_norm = high / torch.norm(high, dim=1, keepdim=True)
-    omega = torch.acos((low_norm * high_norm).sum(1))
-    so = torch.sin(omega)
-    res = (torch.sin((1.0 - val) * omega) / so).unsqueeze(1) * low + (torch.sin(val * omega) / so).unsqueeze(1) * high
-    return res
-
-# losses
-
-def gen_hinge_loss(fake, real):
-    return fake.mean()
-
-def hinge_loss(real, fake):
-    return (F.relu(1 + real) + F.relu(1 - fake)).mean()
-
-def dual_contrastive_loss(real_logits, fake_logits):
-    device = real_logits.device
-    real_logits, fake_logits = map(lambda t: rearrange(t, '... -> (...)'), (real_logits, fake_logits))
-
-    def loss_half(t1, t2):
-        t1 = rearrange(t1, 'i -> i ()')
-        t2 = repeat(t2, 'j -> i j', i = t1.shape[0])
-        t = torch.cat((t1, t2), dim = -1)
-        return F.cross_entropy(t, torch.zeros(t1.shape[0], device = device, dtype = torch.long))
-
-    return loss_half(real_logits, fake_logits) + loss_half(-fake_logits, -real_logits)
-
-# dataset
-
-def convert_rgb_to_transparent(image):
-    if image.mode != 'RGBA':
-        return image.convert('RGBA')
-    return image
-
-def convert_transparent_to_rgb(image):
-    if image.mode != 'RGB':
-        return image.convert('RGB')
-    return image
-
-class expand_greyscale(object):
-    def __init__(self, transparent):
-        self.transparent = transparent
-
-    def __call__(self, tensor):
-        channels = tensor.shape[0]
-        num_target_channels = 4 if self.transparent else 3
-
-        if channels == num_target_channels:
-            return tensor
-
-        alpha = None
-        if channels == 1:
-            color = tensor.expand(3, -1, -1)
-        elif channels == 2:
-            color = tensor[:1].expand(3, -1, -1)
-            alpha = tensor[1:]
+from utils import *
+from version import __version__
+
+# communication blocks
+
+class MeanConv(nn.Module):
+    def __new__(cls, win_size=3, n_dim=2):
+        assert win_size % 2 == 1, "win_size must be odd."
+       
+        if n_dim == 1:
+            return MeanConv2D(win_size)
+        elif n_dim == 2:
+            return MeanConv3D(win_size)
+        elif n_dim == 3:
+            return MeanConv4D(win_size)
         else:
-            raise Exception(f'image with invalid number of channels given {channels}')
+            raise ValueError(f"n_dim must be 1, 2, or 3, but got {n_dim}.")
+   
+    def forward(self, x):
+        raise NotImplementedError
+        # return self.conv(
+        #     F.pad(x.unsqueeze(0), (self.conv.padding[0],)*2, mode=self.padding_mode)
+        #     ).squeeze(0)
 
-        if not exists(alpha) and self.transparent:
-            alpha = torch.ones(1, *tensor.shape[1:], device=tensor.device)
-
-        return color if not self.transparent else torch.cat((color, alpha))
-
-def resize_to_minimum_size(min_size, image):
-    if max(*image.size) < min_size:
-        return torchvision.transforms.functional.resize(image, min_size)
-    return image
-
-class Dataset(data.Dataset):
-    def __init__(self, folder, image_size, transparent = False, aug_prob = 0.):
+class MeanConv2D(nn.Module):
+    def __init__(self, win_size=3) -> None:
         super().__init__()
-        self.folder = folder
-        self.image_size = image_size
-        self.paths = [p for ext in EXTS for p in Path(f'{folder}').glob(f'**/*.{ext}')]
-        assert len(self.paths) > 0, f'No images were found in {folder} for training'
+        self.pad_size = (win_size-1)//2
+        self.conv = nn.Conv2d(1, 1, (win_size,1), bias=False)
+        self.conv.requires_grad_(False)
+        self.conv.weight.data = torch.ones_like(self.conv.weight.data)/win_size
 
-        convert_image_fn = convert_transparent_to_rgb if not transparent else convert_rgb_to_transparent
-        num_channels = 3 if not transparent else 4
+        # register this module as a buffer
+        self.register_buffer('weight', self.conv.weight.data)
 
-        self.transform = transforms.Compose([
-            transforms.Lambda(convert_image_fn),
-            transforms.Lambda(partial(resize_to_minimum_size, image_size)),
-            transforms.Resize(image_size),
-            RandomApply(aug_prob, transforms.RandomResizedCrop(image_size, scale=(0.5, 1.0), ratio=(0.98, 1.02)), transforms.CenterCrop(image_size)),
-            transforms.ToTensor(),
-            transforms.Lambda(expand_greyscale(transparent))
-        ])
+    def forward(self, x):
+        # circular padding
+        x = torch.cat([x[-self.pad_size:,:], x, x[:self.pad_size,:]], dim=0)
+        return self.conv(x.unsqueeze(0)).squeeze(0)
 
-    def __len__(self):
-        return len(self.paths)
-
-    def __getitem__(self, index):
-        path = self.paths[index]
-        img = Image.open(path)
-        return self.transform(img)
-
-# augmentations
-
-def random_hflip(tensor, prob):
-    if prob < random():
-        return tensor
-    return torch.flip(tensor, dims=(3,))
-
-class AugWrapper(nn.Module):
-    def __init__(self, D, image_size):
+class MeanConv3D(nn.Module):
+    def __init__(self, win_size=3) -> None:
         super().__init__()
-        self.D = D
+        self.pad_size = (win_size-1)//2
+        self.conv = nn.Conv3d(1, 1, (win_size,1,1), bias=False)
+        self.conv.requires_grad_(False)
+        self.conv.weight.data = torch.ones_like(self.conv.weight.data)/win_size
 
-    def forward(self, images, prob = 0., types = [], detach = False):
-        if random() < prob:
-            images = random_hflip(images, prob=0.5)
-            images = DiffAugment(images, types=types)
+        # register this module as a buffer
+        self.register_buffer('weight', self.conv.weight.data)
 
-        if detach:
-            images = images.detach()
+    def forward(self, x):
+        # circular padding
+        x = torch.cat([x[-self.pad_size:,:,:], x, x[:self.pad_size,:,:]], dim=0)
+        return self.conv(x.unsqueeze(0)).squeeze(0)
 
-        return self.D(images)
+class MeanConv4D(nn.Module):
+    def __init__(self, win_size=3) -> None:
+        super().__init__()
+        self.pad_size = (win_size-1)//2
+
+        self.conv = nn.Conv3d(1, 1, (3,1,1), bias=False)
+
+        self.conv.requires_grad_(False)
+        self.conv.weight.data = torch.ones_like(self.conv.weight.data)/win_size
+
+        # register this module as a buffer
+        self.register_buffer('weight', self.conv.weight.data)
+
+        
+    def forward(self, x):
+        b,c,h,w = x.shape
+        x = x.view(b,c*h,w)
+        # circular padding
+        x = torch.cat([x[-self.pad_size:,:], x, x[:self.pad_size,:]], dim=0)
+        return self.conv(x.unsqueeze(0)).view(b,c,h,w)
+
+class CommBlock(nn.Module):
+
+    def __init__(self, n_comm_channels, comm_dim, winsize=3) -> None:
+        assert winsize % 2 == 1 and winsize>=1 , "winsize must be odd"
+        super().__init__()
+        self.n_channels = n_comm_channels
+        self.comm_dim = comm_dim
+
+        self.meanConv = MeanConv(win_size=winsize, n_dim=self.comm_dim)
+
+    def forward(self, x):
+        x[:,:self.n_channels] = self.meanConv(x[:,:self.n_channels])
+        return x
 
 # stylegan2 classes
 
@@ -533,17 +216,30 @@ class GeneratorBlock(nn.Module):
         rgb = self.to_rgb(x, prev_rgb, istyle)
         return x, rgb
 
+# TODO: add communication here
 class DiscriminatorBlock(nn.Module):
-    def __init__(self, input_channels, filters, downsample=True):
+    def __init__(self, input_channels, filters, downsample=True, num_comm_channels=0):
         super().__init__()
+        assert filters > num_comm_channels, "Number of communication channels must be less than number of filters"
         self.conv_res = nn.Conv2d(input_channels, filters, 1, stride = (2 if downsample else 1))
 
-        self.net = nn.Sequential(
-            nn.Conv2d(input_channels, filters, 3, padding=1),
-            leaky_relu(),
-            nn.Conv2d(filters, filters, 3, padding=1),
-            leaky_relu()
-        )
+        if num_comm_channels > 0:
+            # here inplace=False is important, otherwise the gradient will not be propagated
+            self.net = nn.Sequential(
+                nn.Conv2d(input_channels, filters, 3, padding=1),
+                leaky_relu(inplace=False),
+                CommBlock(num_comm_channels, 3),
+                nn.Conv2d(filters, filters, 3, padding=1),
+                leaky_relu(inplace=False),
+                CommBlock(num_comm_channels, 3),
+            )
+        else:
+            self.net = nn.Sequential(
+                nn.Conv2d(input_channels, filters, 3, padding=1),
+                leaky_relu(),
+                nn.Conv2d(filters, filters, 3, padding=1),
+                leaky_relu(),
+            )
 
         self.downsample = nn.Sequential(
             Blur(),
@@ -625,7 +321,7 @@ class Generator(nn.Module):
         return rgb
 
 class Discriminator(nn.Module):
-    def __init__(self, image_size, network_capacity = 16, fq_layers = [], fq_dict_size = 256, attn_layers = [], transparent = False, fmap_max = 512):
+    def __init__(self, image_size, network_capacity = 16, fq_layers = [], fq_dict_size = 256, attn_layers = [], transparent = False, fmap_max = 512, num_comm_channels=0):
         super().__init__()
         num_layers = int(log2(image_size) - 1)
         num_init_filters = 3 if not transparent else 4
@@ -645,7 +341,7 @@ class Discriminator(nn.Module):
             num_layer = ind + 1
             is_not_last = ind != (len(chan_in_out) - 1)
 
-            block = DiscriminatorBlock(in_chan, out_chan, downsample = is_not_last)
+            block = DiscriminatorBlock(in_chan, out_chan, downsample = is_not_last, num_comm_channels=num_comm_channels)
             blocks.append(block)
 
             attn_fn = attn_and_ff(out_chan) if num_layer in attn_layers else None
@@ -687,7 +383,21 @@ class Discriminator(nn.Module):
         return x.squeeze(), quantize_loss
 
 class StyleGAN2(nn.Module):
-    def __init__(self, image_size, latent_dim = 512, fmap_max = 512, style_depth = 8, network_capacity = 16, transparent = False, fp16 = False, cl_reg = False, steps = 1, lr = 1e-4, ttur_mult = 2, fq_layers = [], fq_dict_size = 256, attn_layers = [], no_const = False, lr_mlp = 0.1, rank = 0):
+    def __init__(self, 
+        image_size, latent_dim = 512, 
+        fmap_max = 512, style_depth = 8, 
+        network_capacity = 16, transparent = False, fp16 = False, num_comm_channels=0,
+        cl_reg = False, 
+        steps = 1, 
+        lr = 1e-4, 
+        ttur_mult = 2, 
+        fq_layers = [], 
+        fq_dict_size = 256, 
+        attn_layers = [], 
+        no_const = False, 
+        lr_mlp = 0.1, 
+        rank = 0
+        ):
         super().__init__()
         self.lr = lr
         self.steps = steps
@@ -695,7 +405,7 @@ class StyleGAN2(nn.Module):
 
         self.S = StyleVectorizer(latent_dim, style_depth, lr_mul = lr_mlp)
         self.G = Generator(image_size, latent_dim, network_capacity, transparent = transparent, attn_layers = attn_layers, no_const = no_const, fmap_max = fmap_max)
-        self.D = Discriminator(image_size, network_capacity, fq_layers = fq_layers, fq_dict_size = fq_dict_size, attn_layers = attn_layers, transparent = transparent, fmap_max = fmap_max)
+        self.D = Discriminator(image_size, network_capacity, fq_layers = fq_layers, fq_dict_size = fq_dict_size, attn_layers = attn_layers, transparent = transparent, fmap_max = fmap_max, num_comm_channels=num_comm_channels)
 
         self.SE = StyleVectorizer(latent_dim, style_depth, lr_mul = lr_mlp)
         self.GE = Generator(image_size, latent_dim, network_capacity, transparent = transparent, attn_layers = attn_layers, no_const = no_const)
@@ -769,6 +479,7 @@ class Trainer():
         network_capacity = 16,
         fmap_max = 512,
         transparent = False,
+        num_comm_channels=0,
         batch_size = 4,
         mixed_prob = 0.9,
         gradient_accumulate_every=1,
@@ -793,7 +504,8 @@ class Trainer():
         top_k_training = False,
         generator_top_k_gamma = 0.99,
         generator_top_k_frac = 0.5,
-        dual_contrast_loss = False,
+        loss_type = 'hinge',
+        # dual_contrast_loss = False,
         dataset_aug_prob = 0.,
         calculate_fid_every = None,
         calculate_fid_num_images = 12800,
@@ -805,6 +517,8 @@ class Trainer():
         *args,
         **kwargs
     ):
+        assert loss_type in ['hinge', 'bce', 'dual_contrast'], 'loss_type must be one of [hinge, bce, dual_contrast]'
+
         self.GAN_params = [args, kwargs]
         self.GAN = None
 
@@ -822,6 +536,7 @@ class Trainer():
         self.network_capacity = network_capacity
         self.fmap_max = fmap_max
         self.transparent = transparent
+        self.num_comm_channels = num_comm_channels
 
         self.fq_layers = cast_list(fq_layers)
         self.fq_dict_size = fq_dict_size
@@ -880,7 +595,8 @@ class Trainer():
         self.generator_top_k_gamma = generator_top_k_gamma
         self.generator_top_k_frac = generator_top_k_frac
 
-        self.dual_contrast_loss = dual_contrast_loss
+        # self.dual_contrast_loss = dual_contrast_loss
+        self.loss_type = loss_type
 
         assert not (is_ddp and cl_reg), 'Contrastive loss regularization does not work well with multi GPUs yet'
         self.is_ddp = is_ddp
@@ -904,7 +620,14 @@ class Trainer():
         
     def init_GAN(self):
         args, kwargs = self.GAN_params
-        self.GAN = StyleGAN2(lr = self.lr, lr_mlp = self.lr_mlp, ttur_mult = self.ttur_mult, image_size = self.image_size, network_capacity = self.network_capacity, fmap_max = self.fmap_max, transparent = self.transparent, fq_layers = self.fq_layers, fq_dict_size = self.fq_dict_size, attn_layers = self.attn_layers, fp16 = self.fp16, cl_reg = self.cl_reg, no_const = self.no_const, rank = self.rank, *args, **kwargs)
+        self.GAN = StyleGAN2(
+            lr = self.lr, lr_mlp = self.lr_mlp, 
+            ttur_mult = self.ttur_mult, 
+            image_size = self.image_size, network_capacity = self.network_capacity, 
+            fmap_max = self.fmap_max, transparent = self.transparent, num_comm_channels= self.num_comm_channels,
+            fq_layers = self.fq_layers, fq_dict_size = self.fq_dict_size, attn_layers = self.attn_layers, 
+            fp16 = self.fp16, cl_reg = self.cl_reg, no_const = self.no_const, rank = self.rank, 
+            *args, **kwargs)
 
         if self.is_ddp:
             ddp_kwargs = {'device_ids': [self.rank]}
@@ -1006,15 +729,25 @@ class Trainer():
             self.GAN.D_opt.step()
 
         # setup losses
-
-        if not self.dual_contrast_loss:
+        if self.loss_type == 'hinge':
             D_loss_fn = hinge_loss
             G_loss_fn = gen_hinge_loss
             G_requires_reals = False
-        else:
+        elif self.loss_type == 'dual_contrast':
             D_loss_fn = dual_contrastive_loss
             G_loss_fn = dual_contrastive_loss
             G_requires_reals = True
+        elif self.loss_type == 'bce':
+            raise NotImplementedError
+
+        # if not self.dual_contrast_loss:
+        #     D_loss_fn = hinge_loss
+        #     G_loss_fn = gen_hinge_loss
+        #     G_requires_reals = False
+        # else:
+        #     D_loss_fn = dual_contrastive_loss
+        #     G_loss_fn = dual_contrastive_loss
+        #     G_requires_reals = True
 
         # train discriminator
 

@@ -270,8 +270,8 @@ def latent_to_w(style_vectorizer, latent_descr):
 def image_noise(n, im_size, device):
     return torch.FloatTensor(n, im_size, im_size, 1).uniform_(0., 1.).cuda(device)
 
-def leaky_relu(p=0.2):
-    return nn.LeakyReLU(p, inplace=True)
+def leaky_relu(p=0.2, inplace=True):
+    return nn.LeakyReLU(p, inplace=inplace)
 
 def evaluate_in_chunks(max_batch_size, model, *args):
     split_args = list(zip(*list(map(lambda x: x.split(max_batch_size, dim=0), args))))

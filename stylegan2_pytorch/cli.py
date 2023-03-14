@@ -79,6 +79,7 @@ def train_from_folder(
     network_capacity = 16,
     fmap_max = 512,
     transparent = False,
+    num_comm_channels = 0, # for discriminator only
     batch_size = 5,
     gradient_accumulate_every = 6,
     num_train_steps = 150000,
@@ -109,7 +110,8 @@ def train_from_folder(
     top_k_training = False,
     generator_top_k_gamma = 0.99,
     generator_top_k_frac = 0.5,
-    dual_contrast_loss = False,
+    loss_type = 'hinge',
+    # dual_contrast_loss = False,
     dataset_aug_prob = 0.,
     multi_gpus = False,
     calculate_fid_every = None,
@@ -128,6 +130,7 @@ def train_from_folder(
         network_capacity = network_capacity,
         fmap_max = fmap_max,
         transparent = transparent,
+        num_comm_channels = num_comm_channels,
         lr = learning_rate,
         lr_mlp = lr_mlp,
         ttur_mult = ttur_mult,
@@ -149,7 +152,8 @@ def train_from_folder(
         top_k_training = top_k_training,
         generator_top_k_gamma = generator_top_k_gamma,
         generator_top_k_frac = generator_top_k_frac,
-        dual_contrast_loss = dual_contrast_loss,
+        loss_type = loss_type,
+        # dual_contrast_loss = dual_contrast_loss,
         dataset_aug_prob = dataset_aug_prob,
         calculate_fid_every = calculate_fid_every,
         calculate_fid_num_images = calculate_fid_num_images,
@@ -188,3 +192,6 @@ def train_from_folder(
 
 def main():
     fire.Fire(train_from_folder)
+
+if __name__ == '__main__':
+    main()
