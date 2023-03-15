@@ -30,6 +30,7 @@ def set_seed(seed):
 
 def run_training(rank, world_size, model_args, data, load_from, new, num_train_steps, name, seed):
     is_main = rank == 0
+    # rank = 1
     is_ddp = world_size > 1
 
     if is_ddp:
@@ -79,7 +80,8 @@ def train_from_folder(
     network_capacity = 16,
     fmap_max = 512,
     transparent = False,
-    num_comm_channels = 0, # for discriminator only
+    num_comm_channels = 0,  # for discriminator only
+    num_packs = 1,          # for discriminator only
     batch_size = 5,
     gradient_accumulate_every = 6,
     num_train_steps = 150000,
@@ -131,6 +133,7 @@ def train_from_folder(
         fmap_max = fmap_max,
         transparent = transparent,
         num_comm_channels = num_comm_channels,
+        num_packs = num_packs,
         lr = learning_rate,
         lr_mlp = lr_mlp,
         ttur_mult = ttur_mult,

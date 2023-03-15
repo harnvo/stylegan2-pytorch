@@ -321,8 +321,11 @@ class Generator(nn.Module):
         return rgb
 
 class Discriminator(nn.Module):
-    def __init__(self, image_size, network_capacity = 16, fq_layers = [], fq_dict_size = 256, attn_layers = [], transparent = False, fmap_max = 512, num_comm_channels=0):
+    def __init__(self, image_size, network_capacity = 16, fq_layers = [], fq_dict_size = 256, attn_layers = [], transparent = False, fmap_max = 512, num_comm_channels=0, num_packs=1):
         super().__init__()
+        print("num_comm_channels", num_comm_channels)
+        print("num_packs", num_packs)
+        self.num_packs = num_packs 
         num_layers = int(log2(image_size) - 1)
         num_init_filters = 3 if not transparent else 4
 
@@ -354,6 +357,12 @@ class Discriminator(nn.Module):
         self.blocks = nn.ModuleList(blocks)
         self.attn_blocks = nn.ModuleList(attn_blocks)
         self.quantize_blocks = nn.ModuleList(quantize_blocks)
+        
+        self.head_block = self.blocks.pop(0)
+        self.head_attn = self.attn_blocks.pop(0)
+        self.head_quantize = self.quantize_blocks.pop(0)
+
+        self.conn = nn.Conv2d(filters[1]*num_packs, filters[1], 3, padding=1)
 
         chan_last = filters[-1]
         latent_dim = 2 * 2 * chan_last
@@ -366,6 +375,16 @@ class Discriminator(nn.Module):
         b, *_ = x.shape
 
         quantize_loss = torch.zeros(1).to(x)
+
+        x = self.head_block(x)
+        if exists(self.head_attn):
+            x = self.head_attn(x)
+        
+        if exists(self.head_quantize):
+            x, loss = self.head_quantize(x)
+            quantize_loss += loss
+
+        x = self.conn(x.reshape(b//self.num_packs, -1, *x.shape[2:]))
 
         for (block, attn_block, q_block) in zip(self.blocks, self.attn_blocks, self.quantize_blocks):
             x = block(x)
@@ -386,7 +405,7 @@ class StyleGAN2(nn.Module):
     def __init__(self, 
         image_size, latent_dim = 512, 
         fmap_max = 512, style_depth = 8, 
-        network_capacity = 16, transparent = False, fp16 = False, num_comm_channels=0,
+        network_capacity = 16, transparent = False, fp16 = False, num_comm_channels=0, num_packs=1,
         cl_reg = False, 
         steps = 1, 
         lr = 1e-4, 
@@ -405,7 +424,8 @@ class StyleGAN2(nn.Module):
 
         self.S = StyleVectorizer(latent_dim, style_depth, lr_mul = lr_mlp)
         self.G = Generator(image_size, latent_dim, network_capacity, transparent = transparent, attn_layers = attn_layers, no_const = no_const, fmap_max = fmap_max)
-        self.D = Discriminator(image_size, network_capacity, fq_layers = fq_layers, fq_dict_size = fq_dict_size, attn_layers = attn_layers, transparent = transparent, fmap_max = fmap_max, num_comm_channels=num_comm_channels)
+        self.D = Discriminator(image_size, network_capacity, fq_layers = fq_layers, fq_dict_size = fq_dict_size, attn_layers = attn_layers, transparent = transparent, fmap_max = fmap_max, 
+                            num_comm_channels=num_comm_channels, num_packs=num_packs)
 
         self.SE = StyleVectorizer(latent_dim, style_depth, lr_mul = lr_mlp)
         self.GE = Generator(image_size, latent_dim, network_capacity, transparent = transparent, attn_layers = attn_layers, no_const = no_const)
@@ -479,7 +499,8 @@ class Trainer():
         network_capacity = 16,
         fmap_max = 512,
         transparent = False,
-        num_comm_channels=0,
+        num_comm_channels=0, # number of communication channels. For discriminator only.
+        num_packs=1,         # number of packs. For discriminator only.
         batch_size = 4,
         mixed_prob = 0.9,
         gradient_accumulate_every=1,
@@ -517,6 +538,8 @@ class Trainer():
         *args,
         **kwargs
     ):
+        assert batch_size % world_size == 0, 'batch size must be divisible by world size'
+        assert (batch_size // world_size) % num_packs == 0, 'batch size on each gpu must be divisible by num_packs'
         assert loss_type in ['hinge', 'bce', 'dual_contrast'], 'loss_type must be one of [hinge, bce, dual_contrast]'
 
         self.GAN_params = [args, kwargs]
@@ -537,6 +560,7 @@ class Trainer():
         self.fmap_max = fmap_max
         self.transparent = transparent
         self.num_comm_channels = num_comm_channels
+        self.num_packs = num_packs
 
         self.fq_layers = cast_list(fq_layers)
         self.fq_dict_size = fq_dict_size
@@ -624,7 +648,7 @@ class Trainer():
             lr = self.lr, lr_mlp = self.lr_mlp, 
             ttur_mult = self.ttur_mult, 
             image_size = self.image_size, network_capacity = self.network_capacity, 
-            fmap_max = self.fmap_max, transparent = self.transparent, num_comm_channels= self.num_comm_channels,
+            fmap_max = self.fmap_max, transparent = self.transparent, num_comm_channels= self.num_comm_channels, num_packs= self.num_packs,
             fq_layers = self.fq_layers, fq_dict_size = self.fq_dict_size, attn_layers = self.attn_layers, 
             fp16 = self.fp16, cl_reg = self.cl_reg, no_const = self.no_const, rank = self.rank, 
             *args, **kwargs)
@@ -771,6 +795,10 @@ class Trainer():
 
             real_output_loss = real_output
             fake_output_loss = fake_output
+
+            # TODO: debug
+            # breakpoint()
+            # assert real_output.shape == fake_output.shape, f'{real_output.shape} != {fake_output.shape}'
 
             if self.rel_disc_loss:
                 real_output_loss = real_output_loss - fake_output.mean()
