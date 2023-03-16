@@ -30,7 +30,6 @@ def set_seed(seed):
 
 def run_training(rank, world_size, model_args, data, load_from, new, num_train_steps, name, seed):
     is_main = rank == 0
-    # rank = 1
     is_ddp = world_size > 1
 
     if is_ddp:
@@ -63,7 +62,7 @@ def run_training(rank, world_size, model_args, data, load_from, new, num_train_s
         progress_bar.refresh()
         if is_main and model.steps % 50 == 0:
             model.print_log()
-
+    print("saving...")
     model.save(model.checkpoint_num)
 
     if is_ddp:
