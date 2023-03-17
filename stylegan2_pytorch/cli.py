@@ -28,22 +28,22 @@ def set_seed(seed):
     np.random.seed(seed)
     random.seed(seed)
 
-def run_training(rank, world_size, model_args, data, load_from, new, num_train_steps, name, seed):
-    is_main = rank == 0
-    is_ddp = world_size > 1
+def run_training(rank, model_args, data, load_from, new, num_train_steps, name, seed):
+    # is_main = rank == 0
+    # is_ddp = world_size > 1
 
-    if is_ddp:
-        set_seed(seed)
-        os.environ['MASTER_ADDR'] = 'localhost'
-        os.environ['MASTER_PORT'] = '12355'
-        dist.init_process_group('nccl', rank=rank, world_size=world_size)
+    # if is_ddp:
+    #     set_seed(seed)
+    #     os.environ['MASTER_ADDR'] = 'localhost'
+    #     os.environ['MASTER_PORT'] = '12355'
+    #     dist.init_process_group('nccl', rank=rank, world_size=world_size)
 
-        print(f"{rank + 1}/{world_size} process initialized.")
+    #     print(f"{rank + 1}/{world_size} process initialized.")
 
     model_args.update(
-        is_ddp = is_ddp,
+        # is_ddp = is_ddp,
         rank = rank,
-        world_size = world_size
+        # world_size = world_size
     )
 
     model = Trainer(**model_args)
@@ -60,13 +60,13 @@ def run_training(rank, world_size, model_args, data, load_from, new, num_train_s
         retry_call(model.train, tries=3, exceptions=NanException)
         progress_bar.n = model.steps
         progress_bar.refresh()
-        if is_main and model.steps % 50 == 0:
+        if model.steps % 50 == 0:
             model.print_log()
     print("saving...")
     model.save(model.checkpoint_num)
 
-    if is_ddp:
-        dist.destroy_process_group()
+    # if is_ddp:
+    #     dist.destroy_process_group()
 
 def train_from_folder(
     data = './data',
@@ -83,14 +83,14 @@ def train_from_folder(
     num_packs = 1,          # for discriminator only
     batch_size = 5,
     gradient_accumulate_every = 6,
-    num_train_steps = 150000,
+    num_train_steps = 50000,
     learning_rate = 2e-4,
     lr_mlp = 0.1,
     ttur_mult = 1.5,
     rel_disc_loss = False,
     num_workers =  None,
-    save_every = 1000,
-    evaluate_every = 1000,
+    save_every = 500,
+    evaluate_every = 500,
     generate = False,
     num_generate = 1,
     generate_interpolation = False,
@@ -114,7 +114,8 @@ def train_from_folder(
     loss_type = 'hinge',
     # dual_contrast_loss = False,
     dataset_aug_prob = 0.,
-    multi_gpus = False,
+    device = 0,
+    # multi_gpus = False,
     calculate_fid_every = None,
     calculate_fid_num_images = 12800,
     clear_fid_cache = False,
@@ -180,17 +181,19 @@ def train_from_folder(
         model.generate_interpolation(samples_name, num_image_tiles, num_steps = interpolation_num_steps, save_frames = save_frames)
         print(f'interpolation generated at {results_dir}/{name}/{samples_name}')
         return
+    
+    run_training(device, model_args, data, load_from, new, num_train_steps, name, seed)
 
-    world_size = torch.cuda.device_count()
+    # world_size = torch.cuda.device_count()
 
-    if world_size == 1 or not multi_gpus:
-        run_training(0, 1, model_args, data, load_from, new, num_train_steps, name, seed)
-        return
+    # if world_size == 1 or not multi_gpus:
+    #     run_training(0, 1, model_args, data, load_from, new, num_train_steps, name, seed)
+    #     return
 
-    mp.spawn(run_training,
-        args=(world_size, model_args, data, load_from, new, num_train_steps, name, seed),
-        nprocs=world_size,
-        join=True)
+    # mp.spawn(run_training,
+    #     args=(world_size, model_args, data, load_from, new, num_train_steps, name, seed),
+    #     nprocs=world_size,
+    #     join=True)
 
 def main():
     fire.Fire(train_from_folder)

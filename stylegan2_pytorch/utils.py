@@ -213,14 +213,16 @@ def raise_if_nan(t):
     if torch.isnan(t):
         raise NanException
 
-def gradient_accumulate_contexts(gradient_accumulate_every, is_ddp, ddps):
-    if is_ddp:
-        num_no_syncs = gradient_accumulate_every - 1
-        head = [combine_contexts(map(lambda ddp: ddp.no_sync, ddps))] * num_no_syncs
-        tail = [null_context]
-        contexts =  head + tail
-    else:
-        contexts = [null_context] * gradient_accumulate_every
+def gradient_accumulate_contexts(gradient_accumulate_every):
+    # if is_ddp:
+    #     num_no_syncs = gradient_accumulate_every - 1
+    #     head = [combine_contexts(map(lambda ddp: ddp.no_sync, ddps))] * num_no_syncs
+    #     tail = [null_context]
+    #     contexts =  head + tail
+    # else:
+    #     contexts = [null_context] * gradient_accumulate_every
+
+    contexts = [null_context] * gradient_accumulate_every
 
     for context in contexts:
         with context():
@@ -314,6 +316,12 @@ def dual_contrastive_loss(real_logits, fake_logits):
         return F.cross_entropy(t, torch.zeros(t1.shape[0], device = device, dtype = torch.long))
 
     return loss_half(real_logits, fake_logits) + loss_half(-fake_logits, -real_logits)
+
+def gen_bce_loss(fake, real):
+    return F.binary_cross_entropy_with_logits(fake, torch.ones_like(fake))
+
+def bce_loss(real, fake):
+    return F.binary_cross_entropy_with_logits(real, torch.ones_like(real)) + F.binary_cross_entropy_with_logits(fake, torch.zeros_like(fake))
 
 # dataset
 

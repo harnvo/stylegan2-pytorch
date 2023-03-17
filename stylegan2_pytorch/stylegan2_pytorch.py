@@ -76,7 +76,6 @@ class MeanConv4D(nn.Module):
         return self.conv(x.unsqueeze(0)).view(b,c,h,w)
 
 class CommBlock(nn.Module):
-
     def __init__(self, n_comm_channels, comm_dim, winsize=3) -> None:
         assert winsize % 2 == 1 and winsize>=1 , "winsize must be odd"
         super().__init__()
@@ -531,15 +530,14 @@ class Trainer():
         calculate_fid_every = None,
         calculate_fid_num_images = 12800,
         clear_fid_cache = False,
-        is_ddp = False,
+        # is_ddp = False,
         rank = 0,
-        world_size = 1,
+        # world_size = 1,
         log = False,
         *args,
         **kwargs
     ):
-        assert batch_size % world_size == 0, 'batch size must be divisible by world size'
-        assert (batch_size // world_size) % num_packs == 0, 'batch size on each gpu must be divisible by num_packs'
+        assert batch_size % num_packs == 0, 'batch size on each gpu must be divisible by num_packs'
         assert loss_type in ['hinge', 'bce', 'dual_contrast'], 'loss_type must be one of [hinge, bce, dual_contrast]'
 
         self.GAN_params = [args, kwargs]
@@ -622,11 +620,11 @@ class Trainer():
         # self.dual_contrast_loss = dual_contrast_loss
         self.loss_type = loss_type
 
-        assert not (is_ddp and cl_reg), 'Contrastive loss regularization does not work well with multi GPUs yet'
-        self.is_ddp = is_ddp
-        self.is_main = rank == 0
+        # assert not (is_ddp and cl_reg), 'Contrastive loss regularization does not work well with multi GPUs yet'
+        # self.is_ddp = is_ddp
+        # self.is_main = rank == 0
         self.rank = rank
-        self.world_size = world_size
+        # self.world_size = world_size
 
         self.logger = aim.Session(experiment=name) if log else None
 
@@ -653,12 +651,12 @@ class Trainer():
             fp16 = self.fp16, cl_reg = self.cl_reg, no_const = self.no_const, rank = self.rank, 
             *args, **kwargs)
 
-        if self.is_ddp:
-            ddp_kwargs = {'device_ids': [self.rank]}
-            self.S_ddp = DDP(self.GAN.S, **ddp_kwargs)
-            self.G_ddp = DDP(self.GAN.G, **ddp_kwargs)
-            self.D_ddp = DDP(self.GAN.D, **ddp_kwargs)
-            self.D_aug_ddp = DDP(self.GAN.D_aug, **ddp_kwargs)
+        # if self.is_ddp:
+        #     ddp_kwargs = {'device_ids': [self.rank]}
+        #     self.S_ddp = DDP(self.GAN.S, **ddp_kwargs)
+        #     self.G_ddp = DDP(self.GAN.G, **ddp_kwargs)
+        #     self.D_ddp = DDP(self.GAN.D, **ddp_kwargs)
+        #     self.D_aug_ddp = DDP(self.GAN.D_aug, **ddp_kwargs)
 
         if exists(self.logger):
             self.logger.set_params(self.hparams)
@@ -685,9 +683,11 @@ class Trainer():
 
     def set_data_src(self, folder):
         self.dataset = Dataset(folder, self.image_size, transparent = self.transparent, aug_prob = self.dataset_aug_prob)
-        num_workers = num_workers = default(self.num_workers, NUM_CORES if not self.is_ddp else 0)
-        sampler = DistributedSampler(self.dataset, rank=self.rank, num_replicas=self.world_size, shuffle=True) if self.is_ddp else None
-        dataloader = data.DataLoader(self.dataset, num_workers = num_workers, batch_size = math.ceil(self.batch_size / self.world_size), sampler = sampler, shuffle = not self.is_ddp, drop_last = True, pin_memory = True)
+        # num_workers = num_workers = default(self.num_workers, NUM_CORES if not self.is_ddp else 0)
+        num_workers = num_workers = default(self.num_workers, NUM_CORES)
+        # sampler = DistributedSampler(self.dataset, rank=self.rank, num_replicas=self.world_size, shuffle=True) if self.is_ddp else None
+        # dataloader = data.DataLoader(self.dataset, num_workers = num_workers, batch_size = math.ceil(self.batch_size / self.world_size), sampler = sampler, shuffle = not self.is_ddp, drop_last = True, pin_memory = True)
+        dataloader = data.DataLoader(self.dataset, num_workers = num_workers, batch_size = self.batch_size, shuffle = True, drop_last = True, pin_memory = True)
         self.loader = cycle(dataloader)
 
         # auto set augmentation prob for user if dataset is detected to be low
@@ -706,7 +706,8 @@ class Trainer():
         total_disc_loss = torch.tensor(0.).cuda(self.rank)
         total_gen_loss = torch.tensor(0.).cuda(self.rank)
 
-        batch_size = math.ceil(self.batch_size / self.world_size)
+        # batch_size = math.ceil(self.batch_size / self.world_size)
+        batch_size = self.batch_size
 
         image_size = self.GAN.G.image_size
         latent_dim = self.GAN.G.latent_dim
@@ -720,10 +721,15 @@ class Trainer():
         apply_path_penalty = not self.no_pl_reg and self.steps > 5000 and self.steps % 32 == 0
         apply_cl_reg_to_generated = self.steps > 20000
 
-        S = self.GAN.S if not self.is_ddp else self.S_ddp
-        G = self.GAN.G if not self.is_ddp else self.G_ddp
-        D = self.GAN.D if not self.is_ddp else self.D_ddp
-        D_aug = self.GAN.D_aug if not self.is_ddp else self.D_aug_ddp
+        # S = self.GAN.S if not self.is_ddp else self.S_ddp
+        # G = self.GAN.G if not self.is_ddp else self.G_ddp
+        # D = self.GAN.D if not self.is_ddp else self.D_ddp
+        # D_aug = self.GAN.D_aug if not self.is_ddp else self.D_aug_ddp
+
+        S = self.GAN.S
+        G = self.GAN.G
+        D = self.GAN.D
+        D_aug = self.GAN.D_aug
 
         backwards = partial(loss_backwards, self.fp16)
 
@@ -762,7 +768,10 @@ class Trainer():
             G_loss_fn = dual_contrastive_loss
             G_requires_reals = True
         elif self.loss_type == 'bce':
-            raise NotImplementedError
+            D_loss_fn = bce_loss
+            G_loss_fn = gen_bce_loss
+            # raise NotImplementedError
+            G_requires_reals = False
 
         # if not self.dual_contrast_loss:
         #     D_loss_fn = hinge_loss
@@ -778,7 +787,7 @@ class Trainer():
         avg_pl_length = self.pl_mean
         self.GAN.D_opt.zero_grad()
 
-        for i in gradient_accumulate_contexts(self.gradient_accumulate_every, self.is_ddp, ddps=[D_aug, S, G]):
+        for i in gradient_accumulate_contexts(self.gradient_accumulate_every):
             get_latents_fn = mixed_list if random() < self.mixed_prob else noise_list
             style = get_latents_fn(batch_size, num_layers, latent_dim, device=self.rank)
             noise = image_noise(batch_size, image_size, device=self.rank)
@@ -834,7 +843,7 @@ class Trainer():
 
         self.GAN.G_opt.zero_grad()
 
-        for i in gradient_accumulate_contexts(self.gradient_accumulate_every, self.is_ddp, ddps=[S, G, D_aug]):
+        for i in gradient_accumulate_contexts(self.gradient_accumulate_every):
             style = get_latents_fn(batch_size, num_layers, latent_dim, device=self.rank)
             noise = image_noise(batch_size, image_size, device=self.rank)
 
@@ -888,10 +897,10 @@ class Trainer():
             self.pl_mean = self.pl_length_ma.update_average(self.pl_mean, avg_pl_length)
             self.track(self.pl_mean, 'PL')
 
-        if self.is_main and self.steps % 10 == 0 and self.steps > 20000:
+        if self.steps % 10 == 0 and self.steps > 20000:
             self.GAN.EMA()
 
-        if self.is_main and self.steps <= 25000 and self.steps % 1000 == 2:
+        if self.steps <= 25000 and self.steps % 1000 == 2:
             self.GAN.reset_parameter_averaging()
 
         # save from NaN errors
@@ -903,20 +912,20 @@ class Trainer():
 
         # periodically save results
 
-        if self.is_main:
-            if self.steps % self.save_every == 0:
-                self.save(self.checkpoint_num)
+        # if self.is_main:
+        if self.steps % self.save_every == 0:
+            self.save(self.checkpoint_num)
 
-            if self.steps % self.evaluate_every == 0 or (self.steps % 100 == 0 and self.steps < 2500):
-                self.evaluate(floor(self.steps / self.evaluate_every))
+        if self.steps % self.evaluate_every == 0 or (self.steps % 100 == 0 and self.steps < 2500):
+            self.evaluate(floor(self.steps / self.evaluate_every))
 
-            if exists(self.calculate_fid_every) and self.steps % self.calculate_fid_every == 0 and self.steps != 0:
-                num_batches = math.ceil(self.calculate_fid_num_images / self.batch_size)
-                fid = self.calculate_fid(num_batches)
-                self.last_fid = fid
+        if exists(self.calculate_fid_every) and self.steps % self.calculate_fid_every == 0 and self.steps != 0:
+            num_batches = math.ceil(self.calculate_fid_num_images / self.batch_size)
+            fid = self.calculate_fid(num_batches)
+            self.last_fid = fid
 
-                with open(str(self.results_dir / self.name / f'fid_scores.txt'), 'a') as f:
-                    f.write(f'{self.steps},{fid}\n')
+            with open(str(self.results_dir / self.name / f'fid_scores.txt'), 'a') as f:
+                f.write(f'{self.steps},{fid}\n')
 
         self.steps += 1
         self.av = None
