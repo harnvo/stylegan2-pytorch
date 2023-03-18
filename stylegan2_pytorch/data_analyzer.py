@@ -1,0 +1,468 @@
+from utils import *
+from stylegan2_pytorch import Trainer, StyleGAN2
+from argparse import Namespace, ArgumentParser
+from pytorch_fid import fid_score
+from version import __version__
+from torch.utils.tensorboard import SummaryWriter
+class Analyzer():
+    def __init__(
+        self,
+        name = 'default',
+        results_dir = 'results',
+        models_dir = 'models',
+        base_dir = './',
+        data_dir = './data',
+        # image_size = 128,
+        # network_capacity = 16,
+        # fmap_max = 512,
+        # transparent = False,
+        num_comm_channels=0, # number of communication channels. For discriminator only.
+        num_packs=1,         # number of packs. For discriminator only.
+        batch_size = 4,
+        # mixed_prob = 0.9,
+        gradient_accumulate_every=1,
+        # lr = 2e-4, lr_mlp = 0.1, ttur_mult = 2, # for optimizers
+        # rel_disc_loss = False,
+        num_workers = None,
+        # save_every = 1000,
+        # evaluate_every = 1000,
+        num_image_tiles = 8,
+        trunc_psi = 0.6,
+        fp16 = False,
+        cl_reg = False,
+        no_pl_reg = False,
+        fq_layers = [],
+        fq_dict_size = 256,
+        # attn_layers = [],
+        no_const = False,
+        # aug_prob = 0.,
+        # aug_types = ['translation', 'cutout'],
+        top_k_training = False,
+        generator_top_k_gamma = 0.99,
+        generator_top_k_frac = 0.5,
+        loss_type = 'hinge',
+        # dual_contrast_loss = False,
+        # dataset_aug_prob = 0.,
+        calculate_fid_every = None,
+        calculate_fid_num_images = 12800,
+        clear_fid_cache = False,
+        # is_ddp = False,
+        rank = 0,
+        # world_size = 1,
+        log = False,
+        *args,
+        **kwargs
+    ):
+        assert isinstance(rank, int) and rank >= 0, 'rank must be a non-negative integer'
+
+        self.GAN_params = [args, kwargs]
+        self.GAN = None
+
+        self.name = name
+
+        base_dir = Path(base_dir)
+        self.base_dir = base_dir
+        self.results_dir = base_dir / results_dir
+        self.models_dir = base_dir / models_dir
+        self.fid_dir = base_dir / 'fid' / name
+        self.config_path = self.models_dir / name / '.config.json'
+
+        # assert log2(image_size).is_integer(), 'image size must be a power of 2 (64, 128, 256, 512, 1024)'
+        # self.image_size = image_size
+        # self.network_capacity = network_capacity
+        # self.fmap_max = fmap_max
+        # self.transparent = transparent
+        self.num_comm_channels = num_comm_channels
+        self.num_packs = num_packs
+
+
+        self.fq_layers = cast_list(fq_layers)
+        self.fq_dict_size = fq_dict_size
+        self.has_fq = len(self.fq_layers) > 0
+
+        # self.attn_layers = cast_list(attn_layers)
+        self.no_const = no_const
+
+        # self.optimizer = optimizer
+        # self.lr = lr
+        # self.lr_mlp = lr_mlp
+        # self.ttur_mult = ttur_mult
+        # self.rel_disc_loss = rel_disc_loss
+        self.batch_size = batch_size
+        self.num_workers = num_workers
+        # self.mixed_prob = mixed_prob
+
+        self.num_image_tiles = num_image_tiles
+        # self.evaluate_every = evaluate_every
+        # self.save_every = save_every
+        self.steps = 0
+
+        self.av = None
+        self.trunc_psi = trunc_psi
+
+        self.no_pl_reg = no_pl_reg
+        self.pl_mean = None
+
+        self.gradient_accumulate_every = gradient_accumulate_every
+
+        assert not fp16 or fp16 and APEX_AVAILABLE, 'Apex is not available for you to use mixed precision training'
+        self.fp16 = fp16
+
+        self.cl_reg = cl_reg
+
+        self.pl_length_ma = EMA(0.99)
+        self.init_folders()
+
+        # self.dataset_aug_prob = dataset_aug_prob
+
+        self.calculate_fid_every = calculate_fid_every
+        self.calculate_fid_num_images = calculate_fid_num_images
+        self.clear_fid_cache = clear_fid_cache
+
+        self.top_k_training = top_k_training
+        self.generator_top_k_gamma = generator_top_k_gamma
+        self.generator_top_k_frac = generator_top_k_frac
+
+        # self.dual_contrast_loss = dual_contrast_loss
+        self.loss_type = loss_type
+
+        # assert not (is_ddp and cl_reg), 'Contrastive loss regularization does not work well with multi GPUs yet'
+        # self.is_ddp = is_ddp
+        # self.is_main = rank == 0
+        self.rank = rank
+        # self.world_size = world_size
+
+        # self.logger = aim.Session(experiment=name) if log else None
+        self.logger = SummaryWriter(log_dir=self.results_dir / name) if log else None
+
+        self.load_config()
+        self.set_data_src(data_dir)
+
+    @property
+    def image_extension(self):
+        return 'jpg' if not self.transparent else 'png'
+
+    @property
+    def checkpoint_num(self):
+        return len(list(self.models_dir.glob(f'{self.name}/*.pt')))
+
+    @property
+    def hparams(self):
+        return {'image_size': self.image_size, 'network_capacity': self.network_capacity}
+        
+    def init_GAN(self):
+        args, kwargs = self.GAN_params
+
+        # here optimizer, lr, lr_mlp, ttur_mult no longer matters.
+        self.GAN = StyleGAN2(
+            optimizer='adam', lr = 1, lr_mlp = 1, ttur_mult = 1, 
+            image_size = self.image_size, network_capacity = self.network_capacity, 
+            fmap_max = self.fmap_max, transparent = self.transparent, num_comm_channels= self.num_comm_channels, num_packs= self.num_packs,
+            fq_layers = self.fq_layers, fq_dict_size = self.fq_dict_size, attn_layers = self.attn_layers, 
+            fp16 = self.fp16, cl_reg = self.cl_reg, no_const = self.no_const, rank = self.rank, 
+            *args, **kwargs)
+
+        # if self.is_ddp:
+        #     ddp_kwargs = {'device_ids': [self.rank]}
+        #     self.S_ddp = DDP(self.GAN.S, **ddp_kwargs)
+        #     self.G_ddp = DDP(self.GAN.G, **ddp_kwargs)
+        #     self.D_ddp = DDP(self.GAN.D, **ddp_kwargs)
+        #     self.D_aug_ddp = DDP(self.GAN.D_aug, **ddp_kwargs)
+
+        # if exists(self.logger):
+        #     self.logger.set_params(self.hparams)
+
+    def write_config(self):
+        self.config_path.write_text(json.dumps(self.config()))
+
+    def load_config(self):
+        config = json.loads(self.config_path.read_text())
+        self.image_size = config['image_size']
+        self.network_capacity = config['network_capacity']
+        self.transparent = config['transparent']
+        self.fq_layers = config['fq_layers']
+        self.fq_dict_size = config['fq_dict_size']
+
+        self.fmap_max = config.pop('fmap_max', 512)
+        self.attn_layers = config.pop('attn_layers', [])
+        self.no_const = config.pop('no_const', False)
+        self.lr_mlp = config.pop('lr_mlp', 0.1)
+        self.num_comm_channels = config.pop('num_comm_channels', self.num_comm_channels)
+        self.num_packs = config.pop('num_packs', self.num_packs)
+        del self.GAN
+        self.init_GAN()
+
+    def config(self):
+        return {'image_size': self.image_size, 'network_capacity': self.network_capacity, 
+                'lr_mlp': self.lr_mlp, 'transparent': self.transparent, 
+                'fq_layers': self.fq_layers, 'fq_dict_size': self.fq_dict_size, 'attn_layers': self.attn_layers, 'no_const': self.no_const,
+                'num_comm_channels': self.num_comm_channels, 'num_packs': self.num_packs
+                }
+    
+    def analyse_fids(self):
+        fids = []
+        for i in range(self.checkpoint_num):
+            self.load(i)
+            fid = self.calculate_fid(num_batches = self.calculate_fid_num_images // self.batch_size)
+            fids.append(fid)
+
+        if exists(self.logger):
+            self.logger.add_scalars('fids', fids)
+        return fids
+
+    def set_data_src(self, folder):
+        # we should not augment the dataset when doing evaluation
+        self.dataset = Dataset(folder, self.image_size, transparent = self.transparent, aug_prob = 0)
+        num_workers = num_workers = default(self.num_workers, NUM_CORES)
+        dataloader = data.DataLoader(self.dataset, num_workers = num_workers, batch_size = self.batch_size, shuffle = True, drop_last = True, pin_memory = True)
+        self.loader = cycle(dataloader)
+
+        # # auto set augmentation prob for user if dataset is detected to be low
+        # num_samples = len(self.dataset)
+        # if not exists(self.aug_prob) and num_samples < 1e5:
+        #     self.aug_prob = min(0.5, (1e5 - num_samples) * 3e-6)
+        #     print(f'autosetting augmentation probability to {round(self.aug_prob * 100)}%')
+
+    @torch.no_grad()
+    def evaluate(self, num = 0, trunc = 1.0):
+        self.GAN.eval()
+        ext = self.image_extension
+        num_rows = self.num_image_tiles
+    
+        latent_dim = self.GAN.G.latent_dim
+        image_size = self.GAN.G.image_size
+        num_layers = self.GAN.G.num_layers
+
+        # latents and noise
+
+        latents = noise_list(num_rows ** 2, num_layers, latent_dim, device=self.rank)
+        n = image_noise(num_rows ** 2, image_size, device=self.rank)
+
+        # regular
+
+        generated_images = self.generate_truncated(self.GAN.S, self.GAN.G, latents, n, trunc_psi = self.trunc_psi)
+        torchvision.utils.save_image(generated_images, str(self.results_dir / self.name / f'{str(num)}.{ext}'), nrow=num_rows)
+        
+        # moving averages
+
+        generated_images = self.generate_truncated(self.GAN.SE, self.GAN.GE, latents, n, trunc_psi = self.trunc_psi)
+        torchvision.utils.save_image(generated_images, str(self.results_dir / self.name / f'{str(num)}-ema.{ext}'), nrow=num_rows)
+
+        # mixing regularities
+
+        def tile(a, dim, n_tile):
+            init_dim = a.size(dim)
+            repeat_idx = [1] * a.dim()
+            repeat_idx[dim] = n_tile
+            a = a.repeat(*(repeat_idx))
+            order_index = torch.LongTensor(np.concatenate([init_dim * np.arange(n_tile) + i for i in range(init_dim)])).cuda(self.rank)
+            return torch.index_select(a, dim, order_index)
+
+        nn = noise(num_rows, latent_dim, device=self.rank)
+        tmp1 = tile(nn, 0, num_rows)
+        tmp2 = nn.repeat(num_rows, 1)
+
+        tt = int(num_layers / 2)
+        mixed_latents = [(tmp1, tt), (tmp2, num_layers - tt)]
+
+        generated_images = self.generate_truncated(self.GAN.SE, self.GAN.GE, mixed_latents, n, trunc_psi = self.trunc_psi)
+        torchvision.utils.save_image(generated_images, str(self.results_dir / self.name / f'{str(num)}-mr.{ext}'), nrow=num_rows)
+
+    @torch.no_grad()
+    def calculate_fid(self, num_batches):
+        
+        torch.cuda.empty_cache()
+
+        real_path = self.fid_dir / 'real'
+        fake_path = self.fid_dir / 'fake'
+
+        # remove any existing files used for fid calculation and recreate directories
+
+        if not real_path.exists() or self.clear_fid_cache:
+            rmtree(real_path, ignore_errors=True)
+            os.makedirs(real_path)
+
+            for batch_num in tqdm(range(num_batches), desc='calculating FID - saving reals'):
+                real_batch = next(self.loader)
+                for k, image in enumerate(real_batch.unbind(0)):
+                    filename = str(k + batch_num * self.batch_size)
+                    torchvision.utils.save_image(image, str(real_path / f'{filename}.png'))
+
+        # generate a bunch of fake images in results / name / fid_fake
+
+        rmtree(fake_path, ignore_errors=True)
+        os.makedirs(fake_path)
+
+        self.GAN.eval()
+        ext = self.image_extension
+
+        latent_dim = self.GAN.G.latent_dim
+        image_size = self.GAN.G.image_size
+        num_layers = self.GAN.G.num_layers
+
+        for batch_num in tqdm(range(num_batches), desc='calculating FID - saving generated'):
+            # latents and noise
+            latents = noise_list(self.batch_size, num_layers, latent_dim, device=self.rank)
+            noise = image_noise(self.batch_size, image_size, device=self.rank)
+
+            # moving averages
+            generated_images = self.generate_truncated(self.GAN.SE, self.GAN.GE, latents, noise, trunc_psi = self.trunc_psi)
+
+            for j, image in enumerate(generated_images.unbind(0)):
+                torchvision.utils.save_image(image, str(fake_path / f'{str(j + batch_num * self.batch_size)}-ema.{ext}'))
+
+        return fid_score.calculate_fid_given_paths(paths=[str(real_path), str(fake_path)], batch_size=256, device=noise.device, dims=2048)
+
+    @torch.no_grad()
+    def truncate_style(self, tensor, trunc_psi = 0.75):
+        S = self.GAN.S
+        batch_size = self.batch_size
+        latent_dim = self.GAN.G.latent_dim
+
+        if not exists(self.av):
+            z = noise(2000, latent_dim, device=self.rank)
+            samples = evaluate_in_chunks(batch_size, S, z).cpu().numpy()
+            self.av = np.mean(samples, axis = 0)
+            self.av = np.expand_dims(self.av, axis = 0)
+
+        av_torch = torch.from_numpy(self.av).cuda(self.rank)
+        tensor = trunc_psi * (tensor - av_torch) + av_torch
+        return tensor
+
+    @torch.no_grad()
+    def truncate_style_defs(self, w, trunc_psi = 0.75):
+        w_space = []
+        for tensor, num_layers in w:
+            tensor = self.truncate_style(tensor, trunc_psi = trunc_psi)            
+            w_space.append((tensor, num_layers))
+        return w_space
+
+    @torch.no_grad()
+    def generate_truncated(self, S, G, style, noi, trunc_psi = 0.75, num_image_tiles = 8):
+        w = map(lambda t: (S(t[0]), t[1]), style)
+        w_truncated = self.truncate_style_defs(w, trunc_psi = trunc_psi)
+        w_styles = styles_def_to_tensor(w_truncated)
+        generated_images = evaluate_in_chunks(self.batch_size, G, w_styles, noi)
+        return generated_images.clamp_(0., 1.)
+
+    @torch.no_grad()
+    def generate_interpolation(self, num = 0, num_image_tiles = 8, trunc = 1.0, num_steps = 100, save_frames = False):
+        self.GAN.eval()
+        ext = self.image_extension
+        num_rows = num_image_tiles
+
+        latent_dim = self.GAN.G.latent_dim
+        image_size = self.GAN.G.image_size
+        num_layers = self.GAN.G.num_layers
+
+        # latents and noise
+
+        latents_low = noise(num_rows ** 2, latent_dim, device=self.rank)
+        latents_high = noise(num_rows ** 2, latent_dim, device=self.rank)
+        n = image_noise(num_rows ** 2, image_size, device=self.rank)
+
+        ratios = torch.linspace(0., 8., num_steps)
+
+        frames = []
+        for ratio in tqdm(ratios):
+            interp_latents = slerp(ratio, latents_low, latents_high)
+            latents = [(interp_latents, num_layers)]
+            generated_images = self.generate_truncated(self.GAN.SE, self.GAN.GE, latents, n, trunc_psi = self.trunc_psi)
+            images_grid = torchvision.utils.make_grid(generated_images, nrow = num_rows)
+            pil_image = transforms.ToPILImage()(images_grid.cpu())
+            
+            if self.transparent:
+                background = Image.new("RGBA", pil_image.size, (255, 255, 255))
+                pil_image = Image.alpha_composite(background, pil_image)
+                
+            frames.append(pil_image)
+
+        frames[0].save(str(self.results_dir / self.name / f'{str(num)}.gif'), save_all=True, append_images=frames[1:], duration=80, loop=0, optimize=True)
+
+        if save_frames:
+            folder_path = (self.results_dir / self.name / f'{str(num)}')
+            folder_path.mkdir(parents=True, exist_ok=True)
+            for ind, frame in enumerate(frames):
+                frame.save(str(folder_path / f'{str(ind)}.{ext}'))
+
+    # def print_log(self):
+    #     data = [
+    #         ('G', self.g_loss),
+    #         ('D', self.d_loss),
+    #         ('GP', self.last_gp_loss),
+    #         ('PL', self.pl_mean),
+    #         ('CR', self.last_cr_loss),
+    #         ('Q', self.q_loss),
+    #         ('FID', self.last_fid)
+    #     ]
+
+    #     data = [d for d in data if exists(d[1])]
+    #     log = ' | '.join(map(lambda n: f'{n[0]}: {n[1]:.2f}', data))
+    #     print(log)
+
+    def track(self, value, name):
+        if not exists(self.logger):
+            return
+        self.logger.track(value, name = name)
+
+    def model_name(self, num):
+        return str(self.models_dir / self.name / f'model_{num}.pt')
+
+    def init_folders(self):
+        (self.results_dir / self.name).mkdir(parents=True, exist_ok=True)
+        (self.models_dir / self.name).mkdir(parents=True, exist_ok=True)
+
+    # def clear(self):
+    #     rmtree(str(self.models_dir / self.name), True)
+    #     rmtree(str(self.results_dir / self.name), True)
+    #     rmtree(str(self.fid_dir), True)
+    #     rmtree(str(self.config_path), True)
+    #     self.init_folders()
+
+    def save(self, num):
+        save_data = {
+            'GAN': self.GAN.state_dict(),
+            'version': __version__
+        }
+
+        if self.GAN.fp16:
+            save_data['amp'] = amp.state_dict()
+
+        torch.save(save_data, self.model_name(num))
+        self.write_config()
+
+    def load(self, num = -1):
+        self.load_config()
+
+        name = num
+        if num == -1:
+            file_paths = [p for p in Path(self.models_dir / self.name).glob('model_*.pt')]
+            saved_nums = sorted(map(lambda x: int(x.stem.split('_')[1]), file_paths))
+            if len(saved_nums) == 0:
+                return
+            name = saved_nums[-1]
+            print(f'continuing from previous epoch - {name}')
+
+        load_data = torch.load(self.model_name(name))
+
+        if 'version' in load_data:
+            print(f"loading from version {load_data['version']}")
+
+        try:
+            self.GAN.load_state_dict(load_data['GAN'])
+            # we don't need discriminator for analysis
+            del self.GAN.D
+        except Exception as e:
+            print('unable to load save model. please try downgrading the package to the version specified by the saved model')
+            raise e
+        if self.GAN.fp16 and 'amp' in load_data:
+            amp.load_state_dict(load_data['amp'])
+
+if __name__ == '__main__':
+    analyzer = Analyzer(
+        name= 'b32_bce',
+        data_dir='/home/zichuan/data/img_align_celeba',
+        # calculate_fid_num_images = 12800,
+    )
+
+    print(analyzer.analyse_fids())
