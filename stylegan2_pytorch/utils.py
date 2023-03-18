@@ -17,7 +17,7 @@ import numpy as np
 import torch
 from torch import nn, einsum
 from torch.utils import data
-from torch.optim import Adam
+from torch.optim import Adam, SGD, RMSprop
 import torch.nn.functional as F
 from torch.autograd import grad as torch_grad
 from torch.utils.data.distributed import DistributedSampler
@@ -322,6 +322,12 @@ def gen_bce_loss(fake, real):
 
 def bce_loss(real, fake):
     return F.binary_cross_entropy_with_logits(real, torch.ones_like(real)) + F.binary_cross_entropy_with_logits(fake, torch.zeros_like(fake))
+
+def gen_w_loss(fake, real):
+    return -fake.mean()
+
+def w_loss(real, fake):
+    return real.mean() - fake.mean()
 
 # dataset
 

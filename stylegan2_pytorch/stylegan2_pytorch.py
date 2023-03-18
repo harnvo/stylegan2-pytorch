@@ -407,8 +407,7 @@ class StyleGAN2(nn.Module):
         network_capacity = 16, transparent = False, fp16 = False, num_comm_channels=0, num_packs=1,
         cl_reg = False, 
         steps = 1, 
-        lr = 1e-4, 
-        ttur_mult = 2, 
+        optimizer = 'adam', lr = 1e-4, ttur_mult = 2, # for optimizers
         fq_layers = [], 
         fq_dict_size = 256, 
         attn_layers = [], 
@@ -417,6 +416,9 @@ class StyleGAN2(nn.Module):
         rank = 0
         ):
         super().__init__()
+        assert optimizer in ['adam', 'sgd', 'RMSprop'], "optimizer must be one of adam, sgd, RMSprop"
+        assert isinstance(rank, int) and rank >= 0, "rank must be a non-negative integer"
+
         self.lr = lr
         self.steps = steps
         self.ema_updater = EMA(0.995)
@@ -446,8 +448,19 @@ class StyleGAN2(nn.Module):
 
         # init optimizers
         generator_params = list(self.G.parameters()) + list(self.S.parameters())
-        self.G_opt = Adam(generator_params, lr = self.lr, betas=(0.5, 0.9))
-        self.D_opt = Adam(self.D.parameters(), lr = self.lr * ttur_mult, betas=(0.5, 0.9))
+        if optimizer == 'adam':
+            self.G_opt = Adam(generator_params, lr = self.lr, betas=(0.5, 0.9))
+            self.D_opt = Adam(self.D.parameters(), lr = self.lr * ttur_mult, betas=(0.5, 0.9))
+        elif optimizer == 'sgd':
+            self.G_opt = SGD(generator_params, lr = self.lr, momentum=0.9)
+            self.D_opt = SGD(self.D.parameters(), lr = self.lr * ttur_mult, momentum=0.9)
+        elif optimizer == 'RMSprop':
+            self.G_opt = RMSprop(generator_params, lr = self.lr)
+            self.D_opt = RMSprop(self.D.parameters(), lr = self.lr * ttur_mult)
+        else:
+            raise ValueError('optimizer must be adam, sgd, or RMSprop')
+        # self.G_opt = Adam(generator_params, lr = self.lr, betas=(0.5, 0.9))
+        # self.D_opt = Adam(self.D.parameters(), lr = self.lr * ttur_mult, betas=(0.5, 0.9))
 
         # init weights
         self._init_weights()
@@ -503,9 +516,7 @@ class Trainer():
         batch_size = 4,
         mixed_prob = 0.9,
         gradient_accumulate_every=1,
-        lr = 2e-4,
-        lr_mlp = 0.1,
-        ttur_mult = 2,
+        lr = 2e-4, lr_mlp = 0.1, ttur_mult = 2, # for optimizers
         rel_disc_loss = False,
         num_workers = None,
         save_every = 1000,
@@ -538,7 +549,10 @@ class Trainer():
         **kwargs
     ):
         assert batch_size % num_packs == 0, 'batch size on each gpu must be divisible by num_packs'
-        assert loss_type in ['hinge', 'bce', 'dual_contrast'], 'loss_type must be one of [hinge, bce, dual_contrast]'
+        assert loss_type in ['hinge', 'bce', 'dual_contrast', 'wasserstein'], 'loss_type must be one of [hinge, bce, dual_contrast, wasserstein]'
+        assert aug_prob >= 0 and aug_prob <= 1, 'aug_prob must be between 0 and 1'
+        assert dataset_aug_prob >= 0 and dataset_aug_prob <= 1, 'dataset_aug_prob must be between 0 and 1'
+        assert isinstance(rank, int) and rank >= 0, 'rank must be a non-negative integer'
 
         self.GAN_params = [args, kwargs]
         self.GAN = None
@@ -570,6 +584,7 @@ class Trainer():
         self.aug_prob = aug_prob
         self.aug_types = aug_types
 
+        # self.optimizer = optimizer
         self.lr = lr
         self.lr_mlp = lr_mlp
         self.ttur_mult = ttur_mult
@@ -642,9 +657,10 @@ class Trainer():
         
     def init_GAN(self):
         args, kwargs = self.GAN_params
+
+        optimizer = 'RMSprop' if self.loss_type == 'wasserstein' else 'adam'
         self.GAN = StyleGAN2(
-            lr = self.lr, lr_mlp = self.lr_mlp, 
-            ttur_mult = self.ttur_mult, 
+            optimizer=optimizer ,lr = self.lr, lr_mlp = self.lr_mlp, ttur_mult = self.ttur_mult, 
             image_size = self.image_size, network_capacity = self.network_capacity, 
             fmap_max = self.fmap_max, transparent = self.transparent, num_comm_channels= self.num_comm_channels, num_packs= self.num_packs,
             fq_layers = self.fq_layers, fq_dict_size = self.fq_dict_size, attn_layers = self.attn_layers, 
@@ -671,15 +687,22 @@ class Trainer():
         self.transparent = config['transparent']
         self.fq_layers = config['fq_layers']
         self.fq_dict_size = config['fq_dict_size']
+
         self.fmap_max = config.pop('fmap_max', 512)
         self.attn_layers = config.pop('attn_layers', [])
         self.no_const = config.pop('no_const', False)
         self.lr_mlp = config.pop('lr_mlp', 0.1)
+        self.num_comm_channels = config.pop('num_comm_channels', self.num_comm_channels)
+        self.num_packs = config.pop('num_packs', self.num_packs)
         del self.GAN
         self.init_GAN()
 
     def config(self):
-        return {'image_size': self.image_size, 'network_capacity': self.network_capacity, 'lr_mlp': self.lr_mlp, 'transparent': self.transparent, 'fq_layers': self.fq_layers, 'fq_dict_size': self.fq_dict_size, 'attn_layers': self.attn_layers, 'no_const': self.no_const}
+        return {'image_size': self.image_size, 'network_capacity': self.network_capacity, 
+                'lr_mlp': self.lr_mlp, 'transparent': self.transparent,
+                'fq_layers': self.fq_layers, 'fq_dict_size': self.fq_dict_size, 'attn_layers': self.attn_layers, 'no_const': self.no_const,
+                'num_comm_channels': self.num_comm_channels, 'num_packs': self.num_packs
+                }
 
     def set_data_src(self, folder):
         self.dataset = Dataset(folder, self.image_size, transparent = self.transparent, aug_prob = self.dataset_aug_prob)
@@ -758,6 +781,10 @@ class Trainer():
 
             self.GAN.D_opt.step()
 
+            if self.loss_type == 'wsserstein':
+                for p in D.parameters():
+                    p.data.clamp_(-0.01, 0.01)
+
         # setup losses
         if self.loss_type == 'hinge':
             D_loss_fn = hinge_loss
@@ -771,6 +798,10 @@ class Trainer():
             D_loss_fn = bce_loss
             G_loss_fn = gen_bce_loss
             # raise NotImplementedError
+            G_requires_reals = False
+        elif self.loss_type == 'wasserstein':
+            D_loss_fn = w_loss
+            G_loss_fn = gen_w_loss
             G_requires_reals = False
 
         # if not self.dual_contrast_loss:
@@ -838,6 +869,10 @@ class Trainer():
         self.track(self.d_loss, 'D')
 
         self.GAN.D_opt.step()
+
+        if self.loss_type == 'wsserstein':
+            for p in D.parameters():
+                p.data.clamp_(-0.01, 0.01)
 
         # train generator
 
