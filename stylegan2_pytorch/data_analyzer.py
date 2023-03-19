@@ -3,19 +3,24 @@ from stylegan2_pytorch import Trainer, StyleGAN2
 from argparse import Namespace, ArgumentParser
 from pytorch_fid import fid_score
 from version import __version__
+import shutil
+import os
+import glob
+
 from torch.utils.tensorboard import SummaryWriter
+
 class Analyzer():
     def __init__(
         self,
         name = 'default',
-        results_dir = 'results',
+        results_dir = 'reports',
         models_dir = 'models',
         base_dir = './',
         data_dir = './data',
-        # image_size = 128,
-        # network_capacity = 16,
-        # fmap_max = 512,
-        # transparent = False,
+        image_size = 128,
+        network_capacity = 16,
+        fmap_max = 512,
+        transparent = False,
         num_comm_channels=0, # number of communication channels. For discriminator only.
         num_packs=1,         # number of packs. For discriminator only.
         batch_size = 4,
@@ -33,7 +38,7 @@ class Analyzer():
         no_pl_reg = False,
         fq_layers = [],
         fq_dict_size = 256,
-        # attn_layers = [],
+        attn_layers = [],
         no_const = False,
         # aug_prob = 0.,
         # aug_types = ['translation', 'cutout'],
@@ -68,10 +73,10 @@ class Analyzer():
         self.config_path = self.models_dir / name / '.config.json'
 
         # assert log2(image_size).is_integer(), 'image size must be a power of 2 (64, 128, 256, 512, 1024)'
-        # self.image_size = image_size
-        # self.network_capacity = network_capacity
-        # self.fmap_max = fmap_max
-        # self.transparent = transparent
+        self.image_size = image_size
+        self.network_capacity = network_capacity
+        self.fmap_max = fmap_max
+        self.transparent = transparent
         self.num_comm_channels = num_comm_channels
         self.num_packs = num_packs
 
@@ -80,7 +85,7 @@ class Analyzer():
         self.fq_dict_size = fq_dict_size
         self.has_fq = len(self.fq_layers) > 0
 
-        # self.attn_layers = cast_list(attn_layers)
+        self.attn_layers = cast_list(attn_layers)
         self.no_const = no_const
 
         # self.optimizer = optimizer
@@ -155,7 +160,7 @@ class Analyzer():
 
         # here optimizer, lr, lr_mlp, ttur_mult no longer matters.
         self.GAN = StyleGAN2(
-            optimizer='adam', lr = 1, lr_mlp = 1, ttur_mult = 1, 
+            optimizer='adam', lr = 1, lr_mlp = self.lr_mlp, ttur_mult = 1, 
             image_size = self.image_size, network_capacity = self.network_capacity, 
             fmap_max = self.fmap_max, transparent = self.transparent, num_comm_channels= self.num_comm_channels, num_packs= self.num_packs,
             fq_layers = self.fq_layers, fq_dict_size = self.fq_dict_size, attn_layers = self.attn_layers, 
@@ -201,13 +206,17 @@ class Analyzer():
     
     def analyse_fids(self):
         fids = []
+        intra_fids = []
         for i in range(self.checkpoint_num):
             self.load(i)
             fid = self.calculate_fid(num_batches = self.calculate_fid_num_images // self.batch_size)
+            intra_fid = self.calculate_intra_fid()
             fids.append(fid)
+            intra_fids.append(intra_fid)
+            if exists(self.logger):
+                self.logger.add_scalar('fid', fid, i)
+                self.logger.add_scalar('intra_fid', intra_fid, i)
 
-        if exists(self.logger):
-            self.logger.add_scalars('fids', fids)
         return fids
 
     def set_data_src(self, folder):
@@ -296,9 +305,19 @@ class Analyzer():
         self.GAN.eval()
         ext = self.image_extension
 
+
+
         latent_dim = self.GAN.G.latent_dim
         image_size = self.GAN.G.image_size
         num_layers = self.GAN.G.num_layers
+
+        # style = noise_list(batch_size, num_layers, latent_dim, device=self.rank)
+        # noise = image_noise(batch_size, image_size, device=self.rank)
+
+        # w_space = latent_to_w(self.GAN.S, style)
+        # w_styles = styles_def_to_tensor(w_space)
+
+        # generated_images = self.GAN.G(w_styles, noise)
 
         for batch_num in tqdm(range(num_batches), desc='calculating FID - saving generated'):
             # latents and noise
@@ -306,12 +325,43 @@ class Analyzer():
             noise = image_noise(self.batch_size, image_size, device=self.rank)
 
             # moving averages
-            generated_images = self.generate_truncated(self.GAN.SE, self.GAN.GE, latents, noise, trunc_psi = self.trunc_psi)
+            w_space = latent_to_w(self.GAN.SE, latents)
+            w_styles = styles_def_to_tensor(w_space)
+
+            generated_images = self.GAN.GE(w_styles, noise)
+            # generated_images = self.generate_truncated(self.GAN.SE, self.GAN.GE, latents, noise, trunc_psi = self.trunc_psi)
+
+            # torchvision.utils.save_image(generated_images, str(self.results_dir / self.name / f'{str(num)}.{ext}'), nrow=num_rows)
 
             for j, image in enumerate(generated_images.unbind(0)):
-                torchvision.utils.save_image(image, str(fake_path / f'{str(j + batch_num * self.batch_size)}-ema.{ext}'))
+                torchvision.utils.save_image(image, str(fake_path / f'{str(j + batch_num * self.batch_size)}.{ext}'))
 
-        return fid_score.calculate_fid_given_paths(paths=[str(real_path), str(fake_path)], batch_size=256, device=noise.device, dims=2048)
+        return fid_score.calculate_fid_given_paths(paths=[str(real_path), str(fake_path)], batch_size=64, device=noise.device, dims=2048)
+
+    @torch.no_grad()
+    def calculate_intra_fid(self):
+        # this function is called fater calculate_fid, so we can assume that the fake images are already generated
+        fake_path = self.fid_dir / 'fake'
+        # list the num of fake images using glob
+        num_img   = len(glob.glob(str(fake_path / '*')))
+
+        # split the fake images into two sets
+        fake_path1 = self.fid_dir / 'fake1'
+        fake_path2 = self.fid_dir / 'fake2'
+
+        rmtree(fake_path1, ignore_errors=True)
+        rmtree(fake_path2, ignore_errors=True)
+
+        # rename fake_path to fake_path1
+        os.rename(fake_path, fake_path1)
+        os.mkdir(fake_path2)
+
+        # move half of the fake images from fake_path1 to fake_path2
+        for i in range(num_img // 2):
+            shutil.move(str(fake_path1 / f'{str(i)}.{self.image_extension}'), str(fake_path2 / f'{str(i)}.{self.image_extension}'))
+
+        # calculate the fid score between fake_path1 and fake_path2
+        return fid_score.calculate_fid_given_paths(paths=[str(fake_path1), str(fake_path2)], batch_size=64, device=self.rank, dims=2048)
 
     @torch.no_grad()
     def truncate_style(self, tensor, trunc_psi = 0.75):
@@ -385,21 +435,6 @@ class Analyzer():
             for ind, frame in enumerate(frames):
                 frame.save(str(folder_path / f'{str(ind)}.{ext}'))
 
-    # def print_log(self):
-    #     data = [
-    #         ('G', self.g_loss),
-    #         ('D', self.d_loss),
-    #         ('GP', self.last_gp_loss),
-    #         ('PL', self.pl_mean),
-    #         ('CR', self.last_cr_loss),
-    #         ('Q', self.q_loss),
-    #         ('FID', self.last_fid)
-    #     ]
-
-    #     data = [d for d in data if exists(d[1])]
-    #     log = ' | '.join(map(lambda n: f'{n[0]}: {n[1]:.2f}', data))
-    #     print(log)
-
     def track(self, value, name):
         if not exists(self.logger):
             return
@@ -412,25 +447,6 @@ class Analyzer():
         (self.results_dir / self.name).mkdir(parents=True, exist_ok=True)
         (self.models_dir / self.name).mkdir(parents=True, exist_ok=True)
 
-    # def clear(self):
-    #     rmtree(str(self.models_dir / self.name), True)
-    #     rmtree(str(self.results_dir / self.name), True)
-    #     rmtree(str(self.fid_dir), True)
-    #     rmtree(str(self.config_path), True)
-    #     self.init_folders()
-
-    def save(self, num):
-        save_data = {
-            'GAN': self.GAN.state_dict(),
-            'version': __version__
-        }
-
-        if self.GAN.fp16:
-            save_data['amp'] = amp.state_dict()
-
-        torch.save(save_data, self.model_name(num))
-        self.write_config()
-
     def load(self, num = -1):
         self.load_config()
 
@@ -441,12 +457,13 @@ class Analyzer():
             if len(saved_nums) == 0:
                 return
             name = saved_nums[-1]
-            print(f'continuing from previous epoch - {name}')
+            # print(f'continuing from previous epoch - {name}')
 
         load_data = torch.load(self.model_name(name))
+        print(f'loading from save point {name} ...')
 
-        if 'version' in load_data:
-            print(f"loading from version {load_data['version']}")
+        # if 'version' in load_data:
+        #     print(f"loading from version {load_data['version']}")
 
         try:
             self.GAN.load_state_dict(load_data['GAN'])
@@ -458,11 +475,29 @@ class Analyzer():
         if self.GAN.fp16 and 'amp' in load_data:
             amp.load_state_dict(load_data['amp'])
 
+        self.GAN.eval()
+
 if __name__ == '__main__':
+    ArgumentParser.add_argument('--name', type=str)
+    ArgumentParser.add_argument('--data_dir', type=str, default='/home/zichuan/data/img_align_celeba')
+    ArgumentParser.add_argument('--batch_size', type=int, default=32)
+    ArgumentParser.add_argument('--calculate_fid_num_images', type=int, default=6400)
+    ArgumentParser.add_argument('--log', type=bool, default=True)
+    ArgumentParser.add_argument('--num_workers', type=int, default=4)
+    # ArgumentParser.add_argument('--trunc_psi', type=float, default=0)
+    ArgumentParser.add_argument('--rank', type=int, default=1)
+
+    arg = ArgumentParser.parse_args()
+
     analyzer = Analyzer(
-        name= 'b32_bce',
-        data_dir='/home/zichuan/data/img_align_celeba',
-        # calculate_fid_num_images = 12800,
+        name= arg.name,
+        data_dir=arg.data_dir,
+        batch_size=arg.batch_size,
+        calculate_fid_num_images = arg.calculate_fid_num_images,
+        log = arg.log,
+        num_workers = arg.num_workers,
+        # trunc_psi=arg.trunc_psi,
+        rank=arg.rank
     )
 
     print(analyzer.analyse_fids())
