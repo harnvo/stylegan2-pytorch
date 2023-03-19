@@ -217,20 +217,22 @@ class GeneratorBlock(nn.Module):
 
 # TODO: add communication here
 class DiscriminatorBlock(nn.Module):
-    def __init__(self, input_channels, filters, downsample=True, num_comm_channels=0):
+    def __init__(self, input_channels, filters, downsample=True, num_comm_channels=0, comm_channels_prop=0):
         super().__init__()
+        # TODO
+        assert num_comm_channels == 0, "num_comm_channels disabled for now"
         assert filters > num_comm_channels, "Number of communication channels must be less than number of filters"
         self.conv_res = nn.Conv2d(input_channels, filters, 1, stride = (2 if downsample else 1))
 
-        if num_comm_channels > 0:
+        if num_comm_channels > 0 or comm_channels_prop > 0:
             # here inplace=False is important, otherwise the gradient will not be propagated
             self.net = nn.Sequential(
                 nn.Conv2d(input_channels, filters, 3, padding=1),
                 leaky_relu(inplace=False),
-                CommBlock(num_comm_channels, 3),
+                CommBlock(int(filters*comm_channels_prop), 3),
                 nn.Conv2d(filters, filters, 3, padding=1),
                 leaky_relu(inplace=False),
-                CommBlock(num_comm_channels, 3),
+                CommBlock(int(filters*comm_channels_prop), 3),
             )
         else:
             self.net = nn.Sequential(
@@ -320,7 +322,8 @@ class Generator(nn.Module):
         return rgb
 
 class Discriminator(nn.Module):
-    def __init__(self, image_size, network_capacity = 16, fq_layers = [], fq_dict_size = 256, attn_layers = [], transparent = False, fmap_max = 512, num_comm_channels=0, num_packs=1):
+    def __init__(self, image_size, network_capacity = 16, fq_layers = [], fq_dict_size = 256, attn_layers = [], transparent = False, fmap_max = 512,
+                  num_comm_channels=0, num_packs=1, comm_channels_prop=0.25):
         super().__init__()
         print("num_comm_channels", num_comm_channels)
         print("num_packs", num_packs)
@@ -343,7 +346,7 @@ class Discriminator(nn.Module):
             num_layer = ind + 1
             is_not_last = ind != (len(chan_in_out) - 1)
 
-            block = DiscriminatorBlock(in_chan, out_chan, downsample = is_not_last, num_comm_channels=num_comm_channels)
+            block = DiscriminatorBlock(in_chan, out_chan, downsample = is_not_last, num_comm_channels=num_comm_channels, comm_channels_prop=comm_channels_prop)
             blocks.append(block)
 
             attn_fn = attn_and_ff(out_chan) if num_layer in attn_layers else None
@@ -400,11 +403,12 @@ class Discriminator(nn.Module):
         x = self.to_logit(x)
         return x.squeeze(), quantize_loss
 
+# disable num_comm_channels
 class StyleGAN2(nn.Module):
     def __init__(self, 
         image_size, latent_dim = 512, 
         fmap_max = 512, style_depth = 8, 
-        network_capacity = 16, transparent = False, fp16 = False, num_comm_channels=0, num_packs=1,
+        network_capacity = 16, transparent = False, fp16 = False, num_comm_channels=0, num_packs=1, comm_channel_prop=0.25,
         cl_reg = False, 
         steps = 1, 
         optimizer = 'adam', lr = 1e-4, ttur_mult = 2, # for optimizers
@@ -426,7 +430,7 @@ class StyleGAN2(nn.Module):
         self.S = StyleVectorizer(latent_dim, style_depth, lr_mul = lr_mlp)
         self.G = Generator(image_size, latent_dim, network_capacity, transparent = transparent, attn_layers = attn_layers, no_const = no_const, fmap_max = fmap_max)
         self.D = Discriminator(image_size, network_capacity, fq_layers = fq_layers, fq_dict_size = fq_dict_size, attn_layers = attn_layers, transparent = transparent, fmap_max = fmap_max, 
-                            num_comm_channels=num_comm_channels, num_packs=num_packs)
+                            num_comm_channels=num_comm_channels, num_packs=num_packs, comm_channel_prop=comm_channel_prop)
 
         self.SE = StyleVectorizer(latent_dim, style_depth, lr_mul = lr_mlp)
         self.GE = Generator(image_size, latent_dim, network_capacity, transparent = transparent, attn_layers = attn_layers, no_const = no_const)
