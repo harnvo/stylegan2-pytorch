@@ -408,7 +408,7 @@ class StyleGAN2(nn.Module):
     def __init__(self, 
         image_size, latent_dim = 512, 
         fmap_max = 512, style_depth = 8, 
-        network_capacity = 16, transparent = False, fp16 = False, num_comm_channels=0, num_packs=1, comm_channel_prop=0.25,
+        network_capacity = 16, transparent = False, fp16 = False, num_comm_channels=0, num_packs=1, comm_channels_prop=0.25,
         cl_reg = False, 
         steps = 1, 
         optimizer = 'adam', lr = 1e-4, ttur_mult = 2, # for optimizers
@@ -430,7 +430,7 @@ class StyleGAN2(nn.Module):
         self.S = StyleVectorizer(latent_dim, style_depth, lr_mul = lr_mlp)
         self.G = Generator(image_size, latent_dim, network_capacity, transparent = transparent, attn_layers = attn_layers, no_const = no_const, fmap_max = fmap_max)
         self.D = Discriminator(image_size, network_capacity, fq_layers = fq_layers, fq_dict_size = fq_dict_size, attn_layers = attn_layers, transparent = transparent, fmap_max = fmap_max, 
-                            num_comm_channels=num_comm_channels, num_packs=num_packs, comm_channel_prop=comm_channel_prop)
+                            num_comm_channels=num_comm_channels, num_packs=num_packs, comm_channels_prop=comm_channels_prop)
 
         self.SE = StyleVectorizer(latent_dim, style_depth, lr_mul = lr_mlp)
         self.GE = Generator(image_size, latent_dim, network_capacity, transparent = transparent, attn_layers = attn_layers, no_const = no_const)
@@ -517,6 +517,7 @@ class Trainer():
         transparent = False,
         num_comm_channels=0, # number of communication channels. For discriminator only.
         num_packs=1,         # number of packs. For discriminator only.
+        comm_channels_prop=0.5, # proportion of channels to be used for communication. For discriminator only.
         batch_size = 4,
         mixed_prob = 0.9,
         gradient_accumulate_every=1,
@@ -577,6 +578,7 @@ class Trainer():
         self.transparent = transparent
         self.num_comm_channels = num_comm_channels
         self.num_packs = num_packs
+        self.comm_channels_prop = comm_channels_prop
 
         self.fq_layers = cast_list(fq_layers)
         self.fq_dict_size = fq_dict_size
@@ -666,7 +668,8 @@ class Trainer():
         self.GAN = StyleGAN2(
             optimizer=optimizer ,lr = self.lr, lr_mlp = self.lr_mlp, ttur_mult = self.ttur_mult, 
             image_size = self.image_size, network_capacity = self.network_capacity, 
-            fmap_max = self.fmap_max, transparent = self.transparent, num_comm_channels= self.num_comm_channels, num_packs= self.num_packs,
+            fmap_max = self.fmap_max, transparent = self.transparent, 
+            num_comm_channels= self.num_comm_channels, num_packs= self.num_packs, comm_channels_prop= self.comm_channels_prop,
             fq_layers = self.fq_layers, fq_dict_size = self.fq_dict_size, attn_layers = self.attn_layers, 
             fp16 = self.fp16, cl_reg = self.cl_reg, no_const = self.no_const, rank = self.rank, 
             *args, **kwargs)

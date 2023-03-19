@@ -79,8 +79,9 @@ def train_from_folder(
     network_capacity = 16,
     fmap_max = 512,
     transparent = False,
-    num_comm_channels = 0,  # for discriminator only
-    num_packs = 1,          # for discriminator only
+    num_comm_channels = 0,      # for discriminator only
+    num_packs = 1,              # for discriminator only
+    comm_channels_prop = 0,   # for discriminator only
     batch_size = 5,
     gradient_accumulate_every = 6,
     num_train_steps = 50000,
@@ -134,6 +135,7 @@ def train_from_folder(
         transparent = transparent,
         num_comm_channels = num_comm_channels,
         num_packs = num_packs,
+        comm_channels_prop = comm_channels_prop,
         lr = learning_rate,
         lr_mlp = lr_mlp,
         ttur_mult = ttur_mult,
