@@ -215,24 +215,22 @@ class GeneratorBlock(nn.Module):
         rgb = self.to_rgb(x, prev_rgb, istyle)
         return x, rgb
 
-# TODO: add communication here
 class DiscriminatorBlock(nn.Module):
-    def __init__(self, input_channels, filters, downsample=True, num_comm_channels=0, comm_channels_prop=0):
+    def __init__(self, input_channels, filters, downsample=True, num_comm_channels=0):
         super().__init__()
         # TODO
-        assert num_comm_channels == 0, "num_comm_channels disabled for now"
         assert filters > num_comm_channels, "Number of communication channels must be less than number of filters"
         self.conv_res = nn.Conv2d(input_channels, filters, 1, stride = (2 if downsample else 1))
 
-        if num_comm_channels > 0 or comm_channels_prop > 0:
+        if num_comm_channels > 0:
             # here inplace=False is important, otherwise the gradient will not be propagated
             self.net = nn.Sequential(
                 nn.Conv2d(input_channels, filters, 3, padding=1),
                 leaky_relu(inplace=False),
-                CommBlock(int(filters*comm_channels_prop), 3),
+                CommBlock(num_comm_channels, 3),
                 nn.Conv2d(filters, filters, 3, padding=1),
                 leaky_relu(inplace=False),
-                CommBlock(int(filters*comm_channels_prop), 3),
+                CommBlock(num_comm_channels, 3),
             )
         else:
             self.net = nn.Sequential(
@@ -323,9 +321,9 @@ class Generator(nn.Module):
 
 class Discriminator(nn.Module):
     def __init__(self, image_size, network_capacity = 16, fq_layers = [], fq_dict_size = 256, attn_layers = [], transparent = False, fmap_max = 512,
-                  num_comm_channels=0, num_packs=1, comm_channels_prop=0.25):
+                  comm_capacity=0, num_packs=1):
         super().__init__()
-        print("num_comm_channels", num_comm_channels)
+        print("comm_capacity", comm_capacity)
         print("num_packs", num_packs)
         self.num_packs = num_packs 
         num_layers = int(log2(image_size) - 1)
@@ -333,20 +331,21 @@ class Discriminator(nn.Module):
 
         blocks = []
         filters = [num_init_filters] + [(network_capacity * 4) * (2 ** i) for i in range(num_layers + 1)]
+        comm_channels = [comm_capacity * (2 ** i) for i in range(num_layers + 1)]
 
         set_fmap_max = partial(min, fmap_max)
         filters = list(map(set_fmap_max, filters))
-        chan_in_out = list(zip(filters[:-1], filters[1:]))
+        chan_in_out_comm = list( zip(filters[:-1], filters[1:], comm_channels) )
 
         blocks = []
         attn_blocks = []
         quantize_blocks = []
 
-        for ind, (in_chan, out_chan) in enumerate(chan_in_out):
+        for ind, (in_chan, out_chan, comm_chan) in enumerate(chan_in_out_comm):
             num_layer = ind + 1
-            is_not_last = ind != (len(chan_in_out) - 1)
+            is_not_last = ind != (len(chan_in_out_comm) - 1)
 
-            block = DiscriminatorBlock(in_chan, out_chan, downsample = is_not_last, num_comm_channels=num_comm_channels, comm_channels_prop=comm_channels_prop)
+            block = DiscriminatorBlock(in_chan, out_chan, downsample = is_not_last, num_comm_channels=comm_chan)
             blocks.append(block)
 
             attn_fn = attn_and_ff(out_chan) if num_layer in attn_layers else None
@@ -408,7 +407,7 @@ class StyleGAN2(nn.Module):
     def __init__(self, 
         image_size, latent_dim = 512, 
         fmap_max = 512, style_depth = 8, 
-        network_capacity = 16, transparent = False, fp16 = False, num_comm_channels=0, num_packs=1, comm_channels_prop=0.25,
+        network_capacity = 16, transparent = False, fp16 = False, comm_capacity=0, num_packs=1,
         cl_reg = False, 
         steps = 1, 
         optimizer = 'adam', lr = 1e-4, ttur_mult = 2, # for optimizers
@@ -420,6 +419,7 @@ class StyleGAN2(nn.Module):
         rank = 0
         ):
         super().__init__()
+        assert not cl_reg, "contrastive learning disabled for this project"
         assert optimizer in ['adam', 'sgd', 'RMSprop'], "optimizer must be one of adam, sgd, RMSprop"
         assert isinstance(rank, int) and rank >= 0, "rank must be a non-negative integer"
 
@@ -430,7 +430,7 @@ class StyleGAN2(nn.Module):
         self.S = StyleVectorizer(latent_dim, style_depth, lr_mul = lr_mlp)
         self.G = Generator(image_size, latent_dim, network_capacity, transparent = transparent, attn_layers = attn_layers, no_const = no_const, fmap_max = fmap_max)
         self.D = Discriminator(image_size, network_capacity, fq_layers = fq_layers, fq_dict_size = fq_dict_size, attn_layers = attn_layers, transparent = transparent, fmap_max = fmap_max, 
-                            num_comm_channels=num_comm_channels, num_packs=num_packs, comm_channels_prop=comm_channels_prop)
+                            comm_capacity=comm_capacity, num_packs=num_packs)
 
         self.SE = StyleVectorizer(latent_dim, style_depth, lr_mul = lr_mlp)
         self.GE = Generator(image_size, latent_dim, network_capacity, transparent = transparent, attn_layers = attn_layers, no_const = no_const)
@@ -515,9 +515,8 @@ class Trainer():
         network_capacity = 16,
         fmap_max = 512,
         transparent = False,
-        num_comm_channels=0, # number of communication channels. For discriminator only.
+        comm_capacity=0, # number of communication channels. For discriminator only.
         num_packs=1,         # number of packs. For discriminator only.
-        comm_channels_prop=0.5, # proportion of channels to be used for communication. For discriminator only.
         batch_size = 4,
         mixed_prob = 0.9,
         gradient_accumulate_every=1,
@@ -576,9 +575,8 @@ class Trainer():
         self.network_capacity = network_capacity
         self.fmap_max = fmap_max
         self.transparent = transparent
-        self.num_comm_channels = num_comm_channels
+        self.comm_capacity = comm_capacity
         self.num_packs = num_packs
-        self.comm_channels_prop = comm_channels_prop
 
         self.fq_layers = cast_list(fq_layers)
         self.fq_dict_size = fq_dict_size
@@ -659,7 +657,7 @@ class Trainer():
 
     @property
     def hparams(self):
-        return {'image_size': self.image_size, 'network_capacity': self.network_capacity}
+        return {'image_size': self.image_size, 'network_capacity': self.network_capacity, 'comm_capacity':self.comm_capacity, 'num_packs':self.num_packs}
         
     def init_GAN(self):
         args, kwargs = self.GAN_params
@@ -669,7 +667,7 @@ class Trainer():
             optimizer=optimizer ,lr = self.lr, lr_mlp = self.lr_mlp, ttur_mult = self.ttur_mult, 
             image_size = self.image_size, network_capacity = self.network_capacity, 
             fmap_max = self.fmap_max, transparent = self.transparent, 
-            num_comm_channels= self.num_comm_channels, num_packs= self.num_packs, comm_channels_prop= self.comm_channels_prop,
+            comm_capacity=self.comm_capacity, num_packs= self.num_packs,
             fq_layers = self.fq_layers, fq_dict_size = self.fq_dict_size, attn_layers = self.attn_layers, 
             fp16 = self.fp16, cl_reg = self.cl_reg, no_const = self.no_const, rank = self.rank, 
             *args, **kwargs)
@@ -699,7 +697,7 @@ class Trainer():
         self.attn_layers = config.pop('attn_layers', [])
         self.no_const = config.pop('no_const', False)
         self.lr_mlp = config.pop('lr_mlp', 0.1)
-        self.num_comm_channels = config.pop('num_comm_channels', self.num_comm_channels)
+        self.comm_capacity = config.pop('comm_capacity', self.comm_capacity)
         self.num_packs = config.pop('num_packs', self.num_packs)
         del self.GAN
         self.init_GAN()
@@ -708,7 +706,7 @@ class Trainer():
         return {'image_size': self.image_size, 'network_capacity': self.network_capacity, 
                 'lr_mlp': self.lr_mlp, 'transparent': self.transparent,
                 'fq_layers': self.fq_layers, 'fq_dict_size': self.fq_dict_size, 'attn_layers': self.attn_layers, 'no_const': self.no_const,
-                'num_comm_channels': self.num_comm_channels, 'num_packs': self.num_packs
+                'comm_capacity':self.comm_capacity, 'num_packs': self.num_packs
                 }
 
     def set_data_src(self, folder):
@@ -725,6 +723,11 @@ class Trainer():
         if not exists(self.aug_prob) and num_samples < 1e5:
             self.aug_prob = min(0.5, (1e5 - num_samples) * 3e-6)
             print(f'autosetting augmentation probability to {round(self.aug_prob * 100)}%')
+
+    def gen_step(self):
+        if self.fp16:
+            scalar.step(self.GAN.G_opt)
+
 
     def train(self):
         assert exists(self.loader), 'You must first initialize the data source with `.set_data_src(<folder of images>)`'
