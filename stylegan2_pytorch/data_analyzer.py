@@ -1,4 +1,5 @@
 from utils import *
+from matplotlib import pyplot as plt
 from stylegan2_pytorch import Trainer, StyleGAN2
 from argparse import Namespace, ArgumentParser
 from pytorch_fid import fid_score
@@ -217,6 +218,12 @@ class Analyzer():
                 self.logger.add_scalar('fid', fid, i)
                 self.logger.add_scalar('intra_fid', intra_fid, i)
 
+            plt.figure(figsize=(10, 5))
+            plt.plot(fids, label='fid')
+            plt.plot(intra_fids, label='intra_fid')
+            plt.legend()
+            plt.savefig(self.results_dir / self.name / 'fid.png')
+
         return fids
 
     def set_data_src(self, folder):
@@ -349,19 +356,31 @@ class Analyzer():
         fake_path1 = self.fid_dir / 'fake1'
         fake_path2 = self.fid_dir / 'fake2'
 
-        rmtree(fake_path1, ignore_errors=True)
-        rmtree(fake_path2, ignore_errors=True)
+        fid_scores = []
 
-        # rename fake_path to fake_path1
-        os.rename(fake_path, fake_path1)
-        os.mkdir(fake_path2)
+        for i in range(10):
 
-        # move half of the fake images from fake_path1 to fake_path2
-        for i in range(num_img // 2):
-            shutil.move(str(fake_path1 / f'{str(i)}.{self.image_extension}'), str(fake_path2 / f'{str(i)}.{self.image_extension}'))
+            rmtree(fake_path1, ignore_errors=True)
+            rmtree(fake_path2, ignore_errors=True)
+
+            # rename fake_path to fake_path1
+            # os.rename(fake_path, fake_path1)
+            os.mkdir(fake_path1)
+            os.mkdir(fake_path2)
+
+            fake1_nums = np.random.choice(num_img, num_img // 2, replace=False)
+
+            for i in range(num_img):
+                if i in fake1_nums:
+                    shutil.copy(str(fake_path / f'{str(i)}.{self.image_extension}'), str(fake_path1 / f'{str(i)}.{self.image_extension}'))
+                else:
+                    shutil.copy(str(fake_path / f'{str(i)}.{self.image_extension}'), str(fake_path2 / f'{str(i)}.{self.image_extension}'))
+
+            fid_scores.append(fid_score.calculate_fid_given_paths(paths=[str(fake_path1), str(fake_path2)], batch_size=64, device=self.rank, dims=2048))
+
 
         # calculate the fid score between fake_path1 and fake_path2
-        return fid_score.calculate_fid_given_paths(paths=[str(fake_path1), str(fake_path2)], batch_size=64, device=self.rank, dims=2048)
+        return np.mean(fid_scores)
 
     @torch.no_grad()
     def truncate_style(self, tensor, trunc_psi = 0.75):
@@ -435,17 +454,8 @@ class Analyzer():
             for ind, frame in enumerate(frames):
                 frame.save(str(folder_path / f'{str(ind)}.{ext}'))
 
-    def track(self, value, name):
-        if not exists(self.logger):
-            return
-        self.logger.track(value, name = name)
-
     def model_name(self, num):
         return str(self.models_dir / self.name / f'model_{num}.pt')
-
-    def init_folders(self):
-        (self.results_dir / self.name).mkdir(parents=True, exist_ok=True)
-        (self.models_dir / self.name).mkdir(parents=True, exist_ok=True)
 
     def load(self, num = -1):
         self.load_config()
