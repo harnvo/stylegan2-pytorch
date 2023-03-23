@@ -261,10 +261,10 @@ class DiscriminatorBlock(nn.Module):
             self.net = nn.Sequential(
                 nn.Conv2d(input_channels, filters, 3, padding=1),
                 leaky_relu(inplace=False),
-                CommBlock(num_comm_channels, 3, comm_type),
+                CommBlock(num_comm_channels, 3, comm_type=comm_type),
                 nn.Conv2d(filters, filters, 3, padding=1),
                 leaky_relu(inplace=False),
-                CommBlock(num_comm_channels, 3, comm_type),
+                CommBlock(num_comm_channels, 3, comm_type=comm_type),
             )
         else:
             self.net = nn.Sequential(
