@@ -3,16 +3,17 @@ from version import __version__
 
 # communication blocks
 
-class MeanConv(nn.Module):
-    def __new__(cls, win_size=3, n_dim=2):
+class CommConv(nn.Module):
+    def __new__(cls, win_size=3, n_dim=2, comm_type='mean'):
+        assert comm_type in ['mean', 'sharpen', 'maxpool'], "comm_type must be 'mean', 'sharpen', or 'maxpool'."
         assert win_size % 2 == 1, "win_size must be odd."
        
         if n_dim == 1:
-            return MeanConv2D(win_size)
+            return CommConv2D(win_size, comm_type=comm_type)
         elif n_dim == 2:
-            return MeanConv3D(win_size)
+            return CommConv3D(win_size, comm_type=comm_type)
         elif n_dim == 3:
-            return MeanConv4D(win_size)
+            return CommConv4D(win_size, comm_type=comm_type)
         else:
             raise ValueError(f"n_dim must be 1, 2, or 3, but got {n_dim}.")
    
@@ -22,13 +23,24 @@ class MeanConv(nn.Module):
         #     F.pad(x.unsqueeze(0), (self.conv.padding[0],)*2, mode=self.padding_mode)
         #     ).squeeze(0)
 
-class MeanConv2D(nn.Module):
-    def __init__(self, win_size=3) -> None:
+class CommConv2D(nn.Module):
+    def __init__(self, win_size=3, comm_type='mean') -> None:
         super().__init__()
         self.pad_size = (win_size-1)//2
-        self.conv = nn.Conv2d(1, 1, (win_size,1), bias=False)
-        self.conv.requires_grad_(False)
-        self.conv.weight.data = torch.ones_like(self.conv.weight.data)/win_size
+
+        if comm_type == 'mean':
+            self.conv = nn.Conv2d(1, 1, (win_size, 1), bias=False)
+            self.conv.requires_grad_(False)
+            self.conv.weight.data = torch.ones_like(self.conv.weight.data)/win_size
+        elif comm_type == 'sharpen':
+            self.conv = nn.Conv2d(1, 1, (win_size, 1), bias=False)
+            self.conv.requires_grad_(False)
+            self.conv.weight.data =-torch.ones_like(self.conv.weight.data)/win_size
+            self.conv.weight.data[:,:,win_size//2] += 1
+        elif comm_type == 'maxpool':
+            self.conv = nn.MaxPool2d((win_size,1), stride=1)
+        else:
+            raise NotImplementedError
 
         # register this module as a buffer
         self.register_buffer('weight', self.conv.weight.data)
@@ -38,13 +50,24 @@ class MeanConv2D(nn.Module):
         x = torch.cat([x[-self.pad_size:,:], x, x[:self.pad_size,:]], dim=0)
         return self.conv(x.unsqueeze(0)).squeeze(0)
 
-class MeanConv3D(nn.Module):
-    def __init__(self, win_size=3) -> None:
+class CommConv3D(nn.Module):
+    def __init__(self, win_size=3, comm_type='mean') -> None:
         super().__init__()
         self.pad_size = (win_size-1)//2
-        self.conv = nn.Conv3d(1, 1, (win_size,1,1), bias=False)
-        self.conv.requires_grad_(False)
-        self.conv.weight.data = torch.ones_like(self.conv.weight.data)/win_size
+
+        if comm_type == 'mean':
+            self.conv = nn.Conv3d(1, 1, (win_size, 1, 1), bias=False)
+            self.conv.requires_grad_(False)
+            self.conv.weight.data = torch.ones_like(self.conv.weight.data)/win_size
+        elif comm_type == 'sharpen':
+            self.conv = nn.Conv3d(1, 1, (win_size, 1, 1), bias=False)
+            self.conv.requires_grad_(False)
+            self.conv.weight.data =-torch.ones_like(self.conv.weight.data)/win_size
+            self.conv.weight.data[:,:,win_size//2] += 1
+        elif comm_type == 'maxpool':
+            self.conv = nn.MaxPool3d((win_size,1,1), stride=1)
+        else:
+            raise NotImplementedError
 
         # register this module as a buffer
         self.register_buffer('weight', self.conv.weight.data)
@@ -54,15 +77,25 @@ class MeanConv3D(nn.Module):
         x = torch.cat([x[-self.pad_size:,:,:], x, x[:self.pad_size,:,:]], dim=0)
         return self.conv(x.unsqueeze(0)).squeeze(0)
 
-class MeanConv4D(nn.Module):
-    def __init__(self, win_size=3) -> None:
+class CommConv4D(nn.Module):
+    def __init__(self, win_size=3, comm_type='mean') -> None:
         super().__init__()
         self.pad_size = (win_size-1)//2
 
-        self.conv = nn.Conv3d(1, 1, (3,1,1), bias=False)
+        if comm_type == 'mean':
+            self.conv = nn.Conv3d(1, 1, (3, 1, 1), bias=False)
+            self.conv.requires_grad_(False)
+            self.conv.weight.data = torch.ones_like(self.conv.weight.data)/win_size
+        elif comm_type == 'sharpen':
+            self.conv = nn.Conv3d(1, 1, (3, 1, 1), bias=False)
+            self.conv.requires_grad_(False)
+            self.conv.weight.data =-torch.ones_like(self.conv.weight.data)/win_size
+            self.conv.weight.data[:,:,win_size//2] += 1
+        elif comm_type == 'maxpool':
+            self.conv = nn.MaxPool3d((3,1,1), stride=1)
+        else:
+            raise NotImplementedError
 
-        self.conv.requires_grad_(False)
-        self.conv.weight.data = torch.ones_like(self.conv.weight.data)/win_size
 
         # register this module as a buffer
         self.register_buffer('weight', self.conv.weight.data)
@@ -76,16 +109,17 @@ class MeanConv4D(nn.Module):
         return self.conv(x.unsqueeze(0)).view(b,c,h,w)
 
 class CommBlock(nn.Module):
-    def __init__(self, n_comm_channels, comm_dim, winsize=3) -> None:
+    def __init__(self, n_comm_channels, comm_dim, winsize=3, comm_type='mean') -> None:
+        assert comm_type in ['mean', 'sharpen', 'maxpool']
         assert winsize % 2 == 1 and winsize>=1 , "winsize must be odd"
         super().__init__()
         self.n_channels = n_comm_channels
         self.comm_dim = comm_dim
 
-        self.meanConv = MeanConv(win_size=winsize, n_dim=self.comm_dim)
+        self.CommConv = CommConv(win_size=winsize, n_dim=self.comm_dim, comm_type=comm_type)
 
     def forward(self, x):
-        x[:,:self.n_channels] = self.meanConv(x[:,:self.n_channels])
+        x[:,:self.n_channels] = self.CommConv(x[:,:self.n_channels])
         return x
 
 # stylegan2 classes
@@ -216,7 +250,7 @@ class GeneratorBlock(nn.Module):
         return x, rgb
 
 class DiscriminatorBlock(nn.Module):
-    def __init__(self, input_channels, filters, downsample=True, num_comm_channels=0):
+    def __init__(self, input_channels, filters, downsample=True, num_comm_channels=0, comm_type='mean'):
         super().__init__()
         # TODO
         assert filters > num_comm_channels, "Number of communication channels must be less than number of filters"
@@ -227,10 +261,10 @@ class DiscriminatorBlock(nn.Module):
             self.net = nn.Sequential(
                 nn.Conv2d(input_channels, filters, 3, padding=1),
                 leaky_relu(inplace=False),
-                CommBlock(num_comm_channels, 3),
+                CommBlock(num_comm_channels, 3, comm_type),
                 nn.Conv2d(filters, filters, 3, padding=1),
                 leaky_relu(inplace=False),
-                CommBlock(num_comm_channels, 3),
+                CommBlock(num_comm_channels, 3, comm_type),
             )
         else:
             self.net = nn.Sequential(
@@ -321,7 +355,7 @@ class Generator(nn.Module):
 
 class Discriminator(nn.Module):
     def __init__(self, image_size, network_capacity = 16, fq_layers = [], fq_dict_size = 256, attn_layers = [], transparent = False, fmap_max = 512,
-                  comm_capacity=0, num_packs=1):
+                  comm_type='mean', comm_capacity=0, num_packs=1):
         super().__init__()
         print("comm_capacity", comm_capacity)
         print("num_packs", num_packs)
@@ -345,7 +379,8 @@ class Discriminator(nn.Module):
             num_layer = ind + 1
             is_not_last = ind != (len(chan_in_out_comm) - 1)
 
-            block = DiscriminatorBlock(in_chan, out_chan, downsample = is_not_last, num_comm_channels=comm_chan)
+            block = DiscriminatorBlock(in_chan, out_chan, downsample = is_not_last, 
+                                       num_comm_channels=comm_chan, comm_type=comm_type)
             blocks.append(block)
 
             attn_fn = attn_and_ff(out_chan) if num_layer in attn_layers else None
@@ -407,7 +442,8 @@ class StyleGAN2(nn.Module):
     def __init__(self, 
         image_size, latent_dim = 512, 
         fmap_max = 512, style_depth = 8, 
-        network_capacity = 16, transparent = False, fp16 = False, comm_capacity=0, num_packs=1,
+        network_capacity = 16, transparent = False, fp16 = False, 
+        comm_type='mean', comm_capacity=0, num_packs=1,
         cl_reg = False, 
         steps = 1, 
         optimizer = 'adam', lr = 1e-4, ttur_mult = 2, # for optimizers
@@ -430,7 +466,7 @@ class StyleGAN2(nn.Module):
         self.S = StyleVectorizer(latent_dim, style_depth, lr_mul = lr_mlp)
         self.G = Generator(image_size, latent_dim, network_capacity, transparent = transparent, attn_layers = attn_layers, no_const = no_const, fmap_max = fmap_max)
         self.D = Discriminator(image_size, network_capacity, fq_layers = fq_layers, fq_dict_size = fq_dict_size, attn_layers = attn_layers, transparent = transparent, fmap_max = fmap_max, 
-                            comm_capacity=comm_capacity, num_packs=num_packs)
+                            comm_type=comm_type, comm_capacity=comm_capacity, num_packs=num_packs)
 
         self.SE = StyleVectorizer(latent_dim, style_depth, lr_mul = lr_mlp)
         self.GE = Generator(image_size, latent_dim, network_capacity, transparent = transparent, attn_layers = attn_layers, no_const = no_const)
@@ -515,8 +551,9 @@ class Trainer():
         network_capacity = 16,
         fmap_max = 512,
         transparent = False,
-        comm_capacity=0, # number of communication channels. For discriminator only.
-        num_packs=1,         # number of packs. For discriminator only.
+        comm_type = 'mean',     # type of communication.            For discriminator only.
+        comm_capacity=0,        # number of communication channels. For discriminator only.
+        num_packs=1,            # number of packs.                  For discriminator only.
         batch_size = 4,
         mixed_prob = 0.9,
         gradient_accumulate_every=1,
@@ -575,6 +612,7 @@ class Trainer():
         self.network_capacity = network_capacity
         self.fmap_max = fmap_max
         self.transparent = transparent
+        self.comm_type = comm_type
         self.comm_capacity = comm_capacity
         self.num_packs = num_packs
 
@@ -657,7 +695,8 @@ class Trainer():
 
     @property
     def hparams(self):
-        return {'image_size': self.image_size, 'network_capacity': self.network_capacity, 'comm_capacity':self.comm_capacity, 'num_packs':self.num_packs}
+        return {'image_size': self.image_size, 'network_capacity': self.network_capacity, 
+                'comm_type':self.comm_type, 'comm_capacity':self.comm_capacity, 'num_packs':self.num_packs}
         
     def init_GAN(self):
         args, kwargs = self.GAN_params
@@ -667,7 +706,7 @@ class Trainer():
             optimizer=optimizer ,lr = self.lr, lr_mlp = self.lr_mlp, ttur_mult = self.ttur_mult, 
             image_size = self.image_size, network_capacity = self.network_capacity, 
             fmap_max = self.fmap_max, transparent = self.transparent, 
-            comm_capacity=self.comm_capacity, num_packs= self.num_packs,
+            comm_type=self.comm_type, comm_capacity=self.comm_capacity, num_packs= self.num_packs,
             fq_layers = self.fq_layers, fq_dict_size = self.fq_dict_size, attn_layers = self.attn_layers, 
             fp16 = self.fp16, cl_reg = self.cl_reg, no_const = self.no_const, rank = self.rank, 
             *args, **kwargs)
@@ -697,6 +736,7 @@ class Trainer():
         self.attn_layers = config.pop('attn_layers', [])
         self.no_const = config.pop('no_const', False)
         self.lr_mlp = config.pop('lr_mlp', 0.1)
+        self.comm_type = config.pop('comm_type', self.comm_type)
         self.comm_capacity = config.pop('comm_capacity', self.comm_capacity)
         self.num_packs = config.pop('num_packs', self.num_packs)
         del self.GAN
@@ -706,7 +746,7 @@ class Trainer():
         return {'image_size': self.image_size, 'network_capacity': self.network_capacity, 
                 'lr_mlp': self.lr_mlp, 'transparent': self.transparent,
                 'fq_layers': self.fq_layers, 'fq_dict_size': self.fq_dict_size, 'attn_layers': self.attn_layers, 'no_const': self.no_const,
-                'comm_capacity':self.comm_capacity, 'num_packs': self.num_packs
+                'comm_type':self.comm_type, 'comm_capacity':self.comm_capacity, 'num_packs': self.num_packs
                 }
 
     def set_data_src(self, folder):
@@ -723,11 +763,6 @@ class Trainer():
         if not exists(self.aug_prob) and num_samples < 1e5:
             self.aug_prob = min(0.5, (1e5 - num_samples) * 3e-6)
             print(f'autosetting augmentation probability to {round(self.aug_prob * 100)}%')
-
-    def gen_step(self):
-        if self.fp16:
-            scalar.step(self.GAN.G_opt)
-
 
     def train(self):
         assert exists(self.loader), 'You must first initialize the data source with `.set_data_src(<folder of images>)`'

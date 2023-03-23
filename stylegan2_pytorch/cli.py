@@ -79,18 +79,15 @@ def train_from_folder(
     network_capacity = 16,
     fmap_max = 512,
     transparent = False,
-    comm_capacity = 0,      # for discriminator only
-    num_packs = 1,              # for discriminator only
+    comm_type = 'mean', comm_capacity = 0, num_packs = 1, # for discriminator only
     batch_size = 5,
     gradient_accumulate_every = 6,
     num_train_steps = 50000,
-    learning_rate = 2e-4,
-    lr_mlp = 0.1,
+    learning_rate = 2e-4, lr_mlp = 0.1,
     ttur_mult = 1.5,
     rel_disc_loss = False,
     num_workers =  None,
-    save_every = 500,
-    evaluate_every = 500,
+    save_every = 500, evaluate_every = 500,
     generate = False,
     num_generate = 1,
     generate_interpolation = False,
@@ -112,16 +109,22 @@ def train_from_folder(
     generator_top_k_gamma = 0.99,
     generator_top_k_frac = 0.5,
     loss_type = 'hinge',
-    # dual_contrast_loss = False,
     dataset_aug_prob = 0.,
     device = 0,
-    # multi_gpus = False,
     calculate_fid_every = None,
     calculate_fid_num_images = 12800,
     clear_fid_cache = False,
     seed = 42,
     log = False
 ):
+    if name == 'default':
+        name = f"b{batch_size}_{loss_type}"
+        if comm_capacity > 0:
+            name += f"_cc{comm_capacity}"
+            name += f"{comm_type}"
+        if num_packs > 1:
+            name += f"_p{num_packs}"
+        
     model_args = dict(
         name = name,
         results_dir = results_dir,
@@ -132,10 +135,8 @@ def train_from_folder(
         network_capacity = network_capacity,
         fmap_max = fmap_max,
         transparent = transparent,
-        comm_capacity = comm_capacity,
-        num_packs = num_packs,
-        lr = learning_rate,
-        lr_mlp = lr_mlp,
+        comm_type = comm_type, comm_capacity = comm_capacity, num_packs = num_packs,
+        lr = learning_rate, lr_mlp = lr_mlp,
         ttur_mult = ttur_mult,
         rel_disc_loss = rel_disc_loss,
         num_workers = num_workers,
@@ -156,7 +157,6 @@ def train_from_folder(
         generator_top_k_gamma = generator_top_k_gamma,
         generator_top_k_frac = generator_top_k_frac,
         loss_type = loss_type,
-        # dual_contrast_loss = dual_contrast_loss,
         dataset_aug_prob = dataset_aug_prob,
         calculate_fid_every = calculate_fid_every,
         calculate_fid_num_images = calculate_fid_num_images,
