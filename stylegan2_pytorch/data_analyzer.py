@@ -22,16 +22,12 @@ class Analyzer():
         network_capacity = 16,
         fmap_max = 512,
         transparent = False,
-        num_comm_channels=0, # number of communication channels. For discriminator only.
-        num_packs=1,         # number of packs. For discriminator only.
+        comm_type='mean',       # communication type.               For discriminator only.   
+        comm_capacity=0,        # number of communication channels. For discriminator only.
+        num_packs=1,            # number of packs.                  For discriminator only.
         batch_size = 4,
-        # mixed_prob = 0.9,
         gradient_accumulate_every=1,
-        # lr = 2e-4, lr_mlp = 0.1, ttur_mult = 2, # for optimizers
-        # rel_disc_loss = False,
         num_workers = None,
-        # save_every = 1000,
-        # evaluate_every = 1000,
         num_image_tiles = 8,
         trunc_psi = 0.6,
         fp16 = False,
@@ -41,20 +37,14 @@ class Analyzer():
         fq_dict_size = 256,
         attn_layers = [],
         no_const = False,
-        # aug_prob = 0.,
-        # aug_types = ['translation', 'cutout'],
         top_k_training = False,
         generator_top_k_gamma = 0.99,
         generator_top_k_frac = 0.5,
         loss_type = 'hinge',
-        # dual_contrast_loss = False,
-        # dataset_aug_prob = 0.,
         calculate_fid_every = None,
         calculate_fid_num_images = 12800,
         clear_fid_cache = False,
-        # is_ddp = False,
         rank = 0,
-        # world_size = 1,
         log = False,
         *args,
         **kwargs
@@ -73,12 +63,13 @@ class Analyzer():
         self.fid_dir = base_dir / 'fid' / name
         self.config_path = self.models_dir / name / '.config.json'
 
-        # assert log2(image_size).is_integer(), 'image size must be a power of 2 (64, 128, 256, 512, 1024)'
+        assert log2(image_size).is_integer(), 'image size must be a power of 2 (64, 128, 256, 512, 1024)'
         self.image_size = image_size
         self.network_capacity = network_capacity
         self.fmap_max = fmap_max
         self.transparent = transparent
-        self.num_comm_channels = num_comm_channels
+        self.comm_type = comm_type
+        self.comm_capacity = comm_capacity
         self.num_packs = num_packs
 
 
@@ -89,18 +80,10 @@ class Analyzer():
         self.attn_layers = cast_list(attn_layers)
         self.no_const = no_const
 
-        # self.optimizer = optimizer
-        # self.lr = lr
-        # self.lr_mlp = lr_mlp
-        # self.ttur_mult = ttur_mult
-        # self.rel_disc_loss = rel_disc_loss
         self.batch_size = batch_size
         self.num_workers = num_workers
-        # self.mixed_prob = mixed_prob
 
         self.num_image_tiles = num_image_tiles
-        # self.evaluate_every = evaluate_every
-        # self.save_every = save_every
         self.steps = 0
 
         self.av = None
@@ -129,16 +112,10 @@ class Analyzer():
         self.generator_top_k_gamma = generator_top_k_gamma
         self.generator_top_k_frac = generator_top_k_frac
 
-        # self.dual_contrast_loss = dual_contrast_loss
         self.loss_type = loss_type
 
-        # assert not (is_ddp and cl_reg), 'Contrastive loss regularization does not work well with multi GPUs yet'
-        # self.is_ddp = is_ddp
-        # self.is_main = rank == 0
         self.rank = rank
-        # self.world_size = world_size
 
-        # self.logger = aim.Session(experiment=name) if log else None
         self.logger = SummaryWriter(log_dir=self.results_dir / name) if log else None
 
         self.load_config()
@@ -154,7 +131,8 @@ class Analyzer():
 
     @property
     def hparams(self):
-        return {'image_size': self.image_size, 'network_capacity': self.network_capacity}
+        return {'image_size': self.image_size, 'network_capacity': self.network_capacity, 
+                'comm_type':self.comm_type, 'comm_capacity':self.comm_capacity, 'num_packs':self.num_packs}
         
     def init_GAN(self):
         args, kwargs = self.GAN_params
@@ -178,9 +156,6 @@ class Analyzer():
         # if exists(self.logger):
         #     self.logger.set_params(self.hparams)
 
-    def write_config(self):
-        self.config_path.write_text(json.dumps(self.config()))
-
     def load_config(self):
         config = json.loads(self.config_path.read_text())
         self.image_size = config['image_size']
@@ -193,19 +168,26 @@ class Analyzer():
         self.attn_layers = config.pop('attn_layers', [])
         self.no_const = config.pop('no_const', False)
         self.lr_mlp = config.pop('lr_mlp', 0.1)
-        self.num_comm_channels = config.pop('num_comm_channels', self.num_comm_channels)
+        self.comm_type = config.pop('comm_type', self.comm_type)
+        self.comm_papacity = config.pop('comm_capacity', self.comm_capacity)
         self.num_packs = config.pop('num_packs', self.num_packs)
         del self.GAN
         self.init_GAN()
 
     def config(self):
         return {'image_size': self.image_size, 'network_capacity': self.network_capacity, 
-                'lr_mlp': self.lr_mlp, 'transparent': self.transparent, 
+                'lr_mlp': self.lr_mlp, 'transparent': self.transparent,
                 'fq_layers': self.fq_layers, 'fq_dict_size': self.fq_dict_size, 'attn_layers': self.attn_layers, 'no_const': self.no_const,
-                'num_comm_channels': self.num_comm_channels, 'num_packs': self.num_packs
+                'comm_type':self.comm_type, 'comm_capacity':self.comm_capacity, 'num_packs': self.num_packs
                 }
     
-    def analyse_fids(self):
+    def analyse_fids(self, final=True):
+        if final:
+            self.load()
+            fid = self.calculate_fid(num_batches = self.calculate_fid_num_images // self.batch_size)
+            intra_fid = self.calculate_intra_fid()
+            return fid, intra_fid
+        
         fids = []
         intra_fids = []
         for i in range(self.checkpoint_num):
@@ -224,7 +206,7 @@ class Analyzer():
             plt.legend()
             plt.savefig(self.results_dir / self.name / 'fid.png')
 
-        return fids
+        return fids, intra_fids
 
     def set_data_src(self, folder):
         # we should not augment the dataset when doing evaluation
