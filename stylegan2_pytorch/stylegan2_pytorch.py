@@ -11,6 +11,7 @@ class MinibatchBlock(nn.Module):
         # They are equivalent.
         self.minibatch_size = minibatch_size
         
+        self.in_features = in_features
         self.num_kernels = num_kernels # out_features = in_features + self.num_kernels
         self.theta = nn.Linear(in_features, num_kernels * dim_per_kernel, bias=False)
         self.log_weight_scale = nn.Parameter(torch.zeros(num_kernels, dim_per_kernel, dtype=torch.float, requires_grad=True))
