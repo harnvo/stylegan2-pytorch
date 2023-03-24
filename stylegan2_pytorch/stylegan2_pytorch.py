@@ -490,7 +490,7 @@ class StyleGAN2(nn.Module):
         image_size, latent_dim = 512, 
         fmap_max = 512, style_depth = 8, 
         network_capacity = 16, transparent = False, fp16 = False, 
-        comm_type='mean', comm_capacity=0, num_packs=1,
+        comm_type='mean', comm_capacity=0, num_packs=1, minibatch_size=1,
         cl_reg = False, 
         steps = 1, 
         optimizer = 'adam', lr = 1e-4, ttur_mult = 2, # for optimizers
@@ -513,7 +513,7 @@ class StyleGAN2(nn.Module):
         self.S = StyleVectorizer(latent_dim, style_depth, lr_mul = lr_mlp)
         self.G = Generator(image_size, latent_dim, network_capacity, transparent = transparent, attn_layers = attn_layers, no_const = no_const, fmap_max = fmap_max)
         self.D = Discriminator(image_size, network_capacity, fq_layers = fq_layers, fq_dict_size = fq_dict_size, attn_layers = attn_layers, transparent = transparent, fmap_max = fmap_max, 
-                            comm_type=comm_type, comm_capacity=comm_capacity, num_packs=num_packs)
+                            comm_type=comm_type, comm_capacity=comm_capacity, num_packs=num_packs, minibatch_size=minibatch_size)
 
         self.SE = StyleVectorizer(latent_dim, style_depth, lr_mul = lr_mlp)
         self.GE = Generator(image_size, latent_dim, network_capacity, transparent = transparent, attn_layers = attn_layers, no_const = no_const)
@@ -601,6 +601,7 @@ class Trainer():
         comm_type = 'mean',     # type of communication.            For discriminator only.
         comm_capacity=0,        # number of communication channels. For discriminator only.
         num_packs=1,            # number of packs.                  For discriminator only.
+        minibase_size = 4,      # minibase size.                    For discriminator only.
         batch_size = 4,
         mixed_prob = 0.9,
         gradient_accumulate_every=1,
@@ -637,6 +638,7 @@ class Trainer():
         **kwargs
     ):
         assert batch_size % num_packs == 0, 'batch size on each gpu must be divisible by num_packs'
+        assert batch_size % minibase_size == 0, 'batch size on each gpu must be divisible by minibase_size'
         assert loss_type in ['hinge', 'bce', 'dual_contrast', 'wasserstein'], 'loss_type must be one of [hinge, bce, dual_contrast, wasserstein]'
         assert aug_prob >= 0 and aug_prob <= 1, 'aug_prob must be between 0 and 1'
         assert dataset_aug_prob >= 0 and dataset_aug_prob <= 1, 'dataset_aug_prob must be between 0 and 1'
@@ -659,9 +661,11 @@ class Trainer():
         self.network_capacity = network_capacity
         self.fmap_max = fmap_max
         self.transparent = transparent
+        
         self.comm_type = comm_type
         self.comm_capacity = comm_capacity
         self.num_packs = num_packs
+        self.minibase_size = minibase_size
 
         self.fq_layers = cast_list(fq_layers)
         self.fq_dict_size = fq_dict_size
@@ -743,7 +747,7 @@ class Trainer():
     @property
     def hparams(self):
         return {'image_size': self.image_size, 'network_capacity': self.network_capacity, 
-                'comm_type':self.comm_type, 'comm_capacity':self.comm_capacity, 'num_packs':self.num_packs}
+                'comm_type':self.comm_type, 'comm_capacity':self.comm_capacity, 'num_packs':self.num_packs, 'minibase_size':self.minibase_size}
         
     def init_GAN(self):
         args, kwargs = self.GAN_params
@@ -753,7 +757,7 @@ class Trainer():
             optimizer=optimizer ,lr = self.lr, lr_mlp = self.lr_mlp, ttur_mult = self.ttur_mult, 
             image_size = self.image_size, network_capacity = self.network_capacity, 
             fmap_max = self.fmap_max, transparent = self.transparent, 
-            comm_type=self.comm_type, comm_capacity=self.comm_capacity, num_packs= self.num_packs,
+            comm_type=self.comm_type, comm_capacity=self.comm_capacity, num_packs= self.num_packs, minibase_size=self.minibase_size,
             fq_layers = self.fq_layers, fq_dict_size = self.fq_dict_size, attn_layers = self.attn_layers, 
             fp16 = self.fp16, cl_reg = self.cl_reg, no_const = self.no_const, rank = self.rank, 
             *args, **kwargs)
@@ -786,6 +790,7 @@ class Trainer():
         self.comm_type = config.pop('comm_type', self.comm_type)
         self.comm_capacity = config.pop('comm_capacity', self.comm_capacity)
         self.num_packs = config.pop('num_packs', self.num_packs)
+        self.minibase_size = config.pop('minibase_size', self.minibase_size)
         del self.GAN
         self.init_GAN()
 
@@ -793,7 +798,7 @@ class Trainer():
         return {'image_size': self.image_size, 'network_capacity': self.network_capacity, 
                 'lr_mlp': self.lr_mlp, 'transparent': self.transparent,
                 'fq_layers': self.fq_layers, 'fq_dict_size': self.fq_dict_size, 'attn_layers': self.attn_layers, 'no_const': self.no_const,
-                'comm_type':self.comm_type, 'comm_capacity':self.comm_capacity, 'num_packs': self.num_packs
+                'comm_type':self.comm_type, 'comm_capacity':self.comm_capacity, 'num_packs': self.num_packs, 'minibase_size':self.minibase_size
                 }
 
     def set_data_src(self, folder):

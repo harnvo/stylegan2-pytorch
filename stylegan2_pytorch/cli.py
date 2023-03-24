@@ -79,7 +79,7 @@ def train_from_folder(
     network_capacity = 16,
     fmap_max = 512,
     transparent = False,
-    comm_type = 'mean', comm_capacity = 0, num_packs = 1, # for discriminator only
+    comm_type = 'mean', comm_capacity = 0, num_packs = 1, minibatch_size=1, # for discriminator only
     batch_size = 5,
     gradient_accumulate_every = 6,
     num_train_steps = 50000,
@@ -87,7 +87,7 @@ def train_from_folder(
     ttur_mult = 1.5,
     rel_disc_loss = False,
     num_workers =  None,
-    save_every = 500, evaluate_every = 500,
+    save_every = 1000, evaluate_every = 1000,
     generate = False,
     num_generate = 1,
     generate_interpolation = False,
@@ -124,6 +124,8 @@ def train_from_folder(
             name += f"{comm_type}"
         if num_packs > 1:
             name += f"_p{num_packs}"
+        if minibatch_size > 1:
+            name += f"_mb{minibatch_size}"
         
     model_args = dict(
         name = name,
@@ -135,7 +137,7 @@ def train_from_folder(
         network_capacity = network_capacity,
         fmap_max = fmap_max,
         transparent = transparent,
-        comm_type = comm_type, comm_capacity = comm_capacity, num_packs = num_packs,
+        comm_type = comm_type, comm_capacity = comm_capacity, num_packs = num_packs, minibatch_size = minibatch_size,
         lr = learning_rate, lr_mlp = lr_mlp,
         ttur_mult = ttur_mult,
         rel_disc_loss = rel_disc_loss,
