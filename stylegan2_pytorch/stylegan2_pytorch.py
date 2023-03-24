@@ -1,6 +1,46 @@
 from utils import *
 from version import __version__
 
+# minibatch block
+
+class MinibatchBlock(nn.Module):
+    def __init__(self, in_features, num_kernels, dim_per_kernel, minibatch_size=2) -> None:
+        super().__init__()
+        # this is to sample a minibatch from the entire batch. 
+        # The original implementation instead keeps the batch size small to achieve minibatch. 
+        # They are equivalent.
+        self.minibatch_size = minibatch_size
+        
+        self.num_kernels = num_kernels # out_features = in_features + self.num_kernels
+        self.theta = nn.Linear(in_features, num_kernels * dim_per_kernel, bias=False)
+        self.log_weight_scale = nn.Parameter(torch.zeros(num_kernels, dim_per_kernel, dtype=torch.float, requires_grad=True))
+        
+        self.b = nn.Parameter(torch.full((num_kernels,), -1, dtype=torch.float, requires_grad=True))
+        
+        torch.nn.init.normal_(self.theta.weight, std=0.05)
+        
+    def get_out_features(self):
+        return self.in_features + self.num_kernels
+        
+    def forward(self, x):
+        if len(x.shape) > 2:
+            # if the input has more than two dimensions, flatten it into a
+            # batch of feature vectors.
+            x = x.view(x.shape[0], -1)
+            
+        _batch_szie = x.shape[0] // self.minibatch_size
+            
+        # activation.shape = (batch_size, minibatch_size, num_kernels, dim_per_kernel)
+        activation = self.theta(x)
+        activation = activation.view(x.shape[0]//self.minibatch_size, self.minibatch_size, self.num_kernels, -1)
+        abs_dif    = torch.sum(torch.abs(activation.unsqueeze(4) - activation.permute(0,2,3,1).unsqueeze(1)), dim=3)\
+            + 1e6 * torch.eye(self.minibatch_size, device=x.device).unsqueeze(1).unsqueeze(0).expand(_batch_szie, -1, -1, -1)
+            
+        f = torch.sum(torch.exp(-abs_dif), dim=3) + self.b
+        f = f.reshape(x.shape[0], -1)
+        
+        return torch.cat([x, f], dim=1)
+            
 # communication blocks
 
 class CommConv(nn.Module):
@@ -355,7 +395,7 @@ class Generator(nn.Module):
 
 class Discriminator(nn.Module):
     def __init__(self, image_size, network_capacity = 16, fq_layers = [], fq_dict_size = 256, attn_layers = [], transparent = False, fmap_max = 512,
-                  comm_type='mean', comm_capacity=0, num_packs=1):
+                  comm_type='mean', comm_capacity=0, num_packs=1, minibatch_size=1):
         super().__init__()
         print("comm_capacity", comm_capacity)
         print("num_packs", num_packs)
@@ -405,6 +445,12 @@ class Discriminator(nn.Module):
 
         self.final_conv = nn.Conv2d(chan_last, chan_last, 3, padding=1)
         self.flatten = Flatten()
+        # minibatch block
+        if minibatch_size == 1:
+            self.minibatchLayer = nn.Identity()
+        else:
+            self.minibatchLayer = MinibatchBlock(latent_dim, num_kernels=100, minibatch_size=minibatch_size)
+            latent_dim += self.minibatchLayer.get_out_features()
         self.to_logit = nn.Linear(latent_dim, 1)
 
     def forward(self, x):
@@ -434,6 +480,7 @@ class Discriminator(nn.Module):
 
         x = self.final_conv(x)
         x = self.flatten(x)
+        x = self.minibatchLayer(x)
         x = self.to_logit(x)
         return x.squeeze(), quantize_loss
 
@@ -881,10 +928,6 @@ class Trainer():
             real_output_loss = real_output
             fake_output_loss = fake_output
 
-            # TODO: debug
-            # breakpoint()
-            # assert real_output.shape == fake_output.shape, f'{real_output.shape} != {fake_output.shape}'
-
             if self.rel_disc_loss:
                 real_output_loss = real_output_loss - fake_output.mean()
                 fake_output_loss = fake_output_loss - real_output.mean()
@@ -1269,3 +1312,11 @@ class ModelLoader:
         images = self.model.GAN.GE(w_tensors, noise)
         images.clamp_(0., 1.)
         return images
+
+if __name__ == '__main__':
+    # test unit for minibatch block
+    
+    mb = MinibatchBlock(in_features=20, num_kernels=5, dim_per_kernel=3)
+    x = torch.randn(6, 20)
+    out = mb(x)
+    print(out.shape)
