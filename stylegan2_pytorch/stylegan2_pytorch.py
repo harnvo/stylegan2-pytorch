@@ -4,7 +4,7 @@ from version import __version__
 # minibatch block
 
 class MinibatchBlock(nn.Module):
-    def __init__(self, in_features, num_kernels, dim_per_kernel, minibatch_size=2) -> None:
+    def __init__(self, in_features, num_kernels, dim_per_kernel=5, minibatch_size=2) -> None:
         super().__init__()
         # this is to sample a minibatch from the entire batch. 
         # The original implementation instead keeps the batch size small to achieve minibatch. 
