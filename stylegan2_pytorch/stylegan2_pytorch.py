@@ -798,7 +798,7 @@ class Trainer():
         return {'image_size': self.image_size, 'network_capacity': self.network_capacity, 
                 'lr_mlp': self.lr_mlp, 'transparent': self.transparent,
                 'fq_layers': self.fq_layers, 'fq_dict_size': self.fq_dict_size, 'attn_layers': self.attn_layers, 'no_const': self.no_const,
-                'comm_type':self.comm_type, 'comm_capacity':self.comm_capacity, 'num_packs': self.num_packs, minibatch_size: self.minibatch_size
+                'comm_type':self.comm_type, 'comm_capacity':self.comm_capacity, 'num_packs': self.num_packs, 'minibatch_size': self.minibatch_size
                 }
 
     def set_data_src(self, folder):
