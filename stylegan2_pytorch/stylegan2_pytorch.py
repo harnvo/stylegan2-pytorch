@@ -601,7 +601,7 @@ class Trainer():
         comm_type = 'mean',     # type of communication.            For discriminator only.
         comm_capacity=0,        # number of communication channels. For discriminator only.
         num_packs=1,            # number of packs.                  For discriminator only.
-        minibase_size = 4,      # minibase size.                    For discriminator only.
+        minibatch_size = 4,      # minibase size.                    For discriminator only.
         batch_size = 4,
         mixed_prob = 0.9,
         gradient_accumulate_every=1,
@@ -638,7 +638,7 @@ class Trainer():
         **kwargs
     ):
         assert batch_size % num_packs == 0, 'batch size on each gpu must be divisible by num_packs'
-        assert batch_size % minibase_size == 0, 'batch size on each gpu must be divisible by minibase_size'
+        assert batch_size % minibatch_size == 0, 'batch size on each gpu must be divisible by minibatch_size'
         assert loss_type in ['hinge', 'bce', 'dual_contrast', 'wasserstein'], 'loss_type must be one of [hinge, bce, dual_contrast, wasserstein]'
         assert aug_prob >= 0 and aug_prob <= 1, 'aug_prob must be between 0 and 1'
         assert dataset_aug_prob >= 0 and dataset_aug_prob <= 1, 'dataset_aug_prob must be between 0 and 1'
@@ -665,7 +665,7 @@ class Trainer():
         self.comm_type = comm_type
         self.comm_capacity = comm_capacity
         self.num_packs = num_packs
-        self.minibase_size = minibase_size
+        self.minibatch_size = minibatch_size
 
         self.fq_layers = cast_list(fq_layers)
         self.fq_dict_size = fq_dict_size
@@ -747,7 +747,7 @@ class Trainer():
     @property
     def hparams(self):
         return {'image_size': self.image_size, 'network_capacity': self.network_capacity, 
-                'comm_type':self.comm_type, 'comm_capacity':self.comm_capacity, 'num_packs':self.num_packs, 'minibase_size':self.minibase_size}
+                'comm_type':self.comm_type, 'comm_capacity':self.comm_capacity, 'num_packs':self.num_packs, 'minibatch_size':self.minibatch_size}
         
     def init_GAN(self):
         args, kwargs = self.GAN_params
@@ -757,7 +757,7 @@ class Trainer():
             optimizer=optimizer ,lr = self.lr, lr_mlp = self.lr_mlp, ttur_mult = self.ttur_mult, 
             image_size = self.image_size, network_capacity = self.network_capacity, 
             fmap_max = self.fmap_max, transparent = self.transparent, 
-            comm_type=self.comm_type, comm_capacity=self.comm_capacity, num_packs= self.num_packs, minibase_size=self.minibase_size,
+            comm_type=self.comm_type, comm_capacity=self.comm_capacity, num_packs= self.num_packs, minibatch_size=self.minibatch_size,
             fq_layers = self.fq_layers, fq_dict_size = self.fq_dict_size, attn_layers = self.attn_layers, 
             fp16 = self.fp16, cl_reg = self.cl_reg, no_const = self.no_const, rank = self.rank, 
             *args, **kwargs)
@@ -790,7 +790,7 @@ class Trainer():
         self.comm_type = config.pop('comm_type', self.comm_type)
         self.comm_capacity = config.pop('comm_capacity', self.comm_capacity)
         self.num_packs = config.pop('num_packs', self.num_packs)
-        self.minibase_size = config.pop('minibase_size', self.minibase_size)
+        self.minibatch_size = config.pop('minibatch_size', self.minibatch_size)
         del self.GAN
         self.init_GAN()
 
@@ -798,7 +798,7 @@ class Trainer():
         return {'image_size': self.image_size, 'network_capacity': self.network_capacity, 
                 'lr_mlp': self.lr_mlp, 'transparent': self.transparent,
                 'fq_layers': self.fq_layers, 'fq_dict_size': self.fq_dict_size, 'attn_layers': self.attn_layers, 'no_const': self.no_const,
-                'comm_type':self.comm_type, 'comm_capacity':self.comm_capacity, 'num_packs': self.num_packs, 'minibase_size':self.minibase_size
+                'comm_type':self.comm_type, 'comm_capacity':self.comm_capacity, 'num_packs': self.num_packs, minibatch_size: self.minibatch_size
                 }
 
     def set_data_src(self, folder):
