@@ -451,7 +451,7 @@ class Discriminator(nn.Module):
             self.minibatchLayer = nn.Identity()
         else:
             self.minibatchLayer = MinibatchBlock(latent_dim, num_kernels=100, minibatch_size=minibatch_size)
-            latent_dim += self.minibatchLayer.get_out_features()
+            latent_dim = self.minibatchLayer.get_out_features()
         self.to_logit = nn.Linear(latent_dim, 1)
 
     def forward(self, x):
@@ -1322,7 +1322,13 @@ class ModelLoader:
 if __name__ == '__main__':
     # test unit for minibatch block
     
-    mb = MinibatchBlock(in_features=20, num_kernels=5, dim_per_kernel=3)
-    x = torch.randn(6, 20)
+    mb = MinibatchBlock(in_features=20, num_kernels=5, dim_per_kernel=3, minibatch_size=8)
+    x = torch.randn(32, 20)
     out = mb(x)
+    print(mb.get_out_features())
     print(out.shape)
+    
+    # fcl = nn.FullyConnectedLayer(in_features=mb.get_out_features(), out_features=10)
+    fcl = nn.Linear(mb.get_out_features(), 10)
+    
+    print(fcl(out).shape)
