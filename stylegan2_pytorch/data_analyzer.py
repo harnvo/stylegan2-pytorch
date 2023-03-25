@@ -180,33 +180,53 @@ class Analyzer():
                 'fq_layers': self.fq_layers, 'fq_dict_size': self.fq_dict_size, 'attn_layers': self.attn_layers, 'no_const': self.no_const,
                 'comm_type':self.comm_type, 'comm_capacity':self.comm_capacity, 'num_packs': self.num_packs
                 }
-    
-    def analyse_fids(self, final=True):
-        if final:
-            self.load()
-            fid = self.calculate_fid(num_batches = self.calculate_fid_num_images // self.batch_size)
-            intra_fid = self.calculate_intra_fid()
-            return fid, intra_fid
+        
+    def analyse_fid(self, num=-1):
+        self.load(num)
+        num_repetitions = 50
         
         fids = []
         intra_fids = []
-        for i in range(self.checkpoint_num):
-            self.load(i)
+        for i in range(num_repetitions):
             fid = self.calculate_fid(num_batches = self.calculate_fid_num_images // self.batch_size)
             intra_fid = self.calculate_intra_fid()
             fids.append(fid)
             intra_fids.append(intra_fid)
-            if exists(self.logger):
-                self.logger.add_scalar('fid', fid, i)
-                self.logger.add_scalar('intra_fid', intra_fid, i)
+            
+        if not os.path.exists(self.results_dir):
+            os.makedirs(self.results_dir)
+        
+        with open(self.results_dir / f'{self.name}_fid.txt', 'w') as f:
+            f.write(f'{np.mean(fids)}, {np.std(fids)}, {np.mean(intra_fids)}, {np.std(intra_fids)}\n')
+            
+        return np.mean(fids), np.std(fids), np.mean(intra_fids), np.std(intra_fids)
+    
+    # def analyse_fids(self, final=True):
+    #     if final:
+    #         self.load()
+    #         fid = self.calculate_fid(num_batches = self.calculate_fid_num_images // self.batch_size)
+    #         intra_fid = self.calculate_intra_fid()
+    #         return fid, intra_fid
+        
+    #     fids = []
+    #     intra_fids = []
+    #     for i in range(self.checkpoint_num):
+    #         self.load(i)
+    #         fid = self.calculate_fid(num_batches = self.calculate_fid_num_images // self.batch_size)
+    #         intra_fid = self.calculate_intra_fid()
+    #         fids.append(fid)
+    #         intra_fids.append(intra_fid)
+    #         if exists(self.logger):
+    #             self.logger.add_scalar('fid', fid, i)
+    #             self.logger.add_scalar('intra_fid', intra_fid, i)
 
-            plt.figure(figsize=(10, 5))
-            plt.plot(fids, label='fid')
-            plt.plot(intra_fids, label='intra_fid')
-            plt.legend()
-            plt.savefig(self.results_dir / self.name / 'fid.png')
+    #         plt.figure(figsize=(10, 5))
+    #         plt.plot(fids, label='fid')
+    #         plt.plot(intra_fids, label='intra_fid')
+    #         plt.legend()
+    #         plt.savefig(self.results_dir / self.name / 'fid.png')
 
-        return fids, intra_fids
+    #     return fids, intra_fids
 
     def set_data_src(self, folder):
         # we should not augment the dataset when doing evaluation
@@ -489,7 +509,8 @@ if __name__ == '__main__':
         log = arg.log,
         num_workers = arg.num_workers,
         # trunc_psi=arg.trunc_psi,
-        rank=arg.rank
+        rank=arg.rank,
+        clear_fid_cache=True
     )
 
     print(analyzer.analyse_fids())
