@@ -439,8 +439,11 @@ class Discriminator(nn.Module):
         self.head_attn = self.attn_blocks.pop(0)
         self.head_quantize = self.quantize_blocks.pop(0)
 
-        self.conn = nn.Conv2d(filters[1]*num_packs, filters[1], 3, padding=1)
-
+        if num_packs > 1:
+            self.conn = nn.Conv2d(filters[1]*num_packs, filters[1], 3, padding=1)
+        else:
+            self.conn = nn.Identity()
+            
         chan_last = filters[-1]
         latent_dim = 2 * 2 * chan_last
 
