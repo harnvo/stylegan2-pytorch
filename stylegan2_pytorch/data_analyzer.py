@@ -25,6 +25,7 @@ class Analyzer():
         comm_type='mean',       # communication type.               For discriminator only.   
         comm_capacity=0,        # number of communication channels. For discriminator only.
         num_packs=1,            # number of packs.                  For discriminator only.
+        minibatch_size=1,       # minibatch size.                   For discriminator only.
         batch_size = 4,
         gradient_accumulate_every=1,
         num_workers = None,
@@ -71,6 +72,7 @@ class Analyzer():
         self.comm_type = comm_type
         self.comm_capacity = comm_capacity
         self.num_packs = num_packs
+        self.minibatch_size = minibatch_size
 
 
         self.fq_layers = cast_list(fq_layers)
@@ -100,7 +102,7 @@ class Analyzer():
         self.cl_reg = cl_reg
 
         self.pl_length_ma = EMA(0.99)
-        self.init_folders()
+        # self.init_folders()
 
         # self.dataset_aug_prob = dataset_aug_prob
 
@@ -132,7 +134,7 @@ class Analyzer():
     @property
     def hparams(self):
         return {'image_size': self.image_size, 'network_capacity': self.network_capacity, 
-                'comm_type':self.comm_type, 'comm_capacity':self.comm_capacity, 'num_packs':self.num_packs}
+                'comm_type':self.comm_type, 'comm_capacity':self.comm_capacity, 'num_packs':self.num_packs, 'minibatch_size':self.minibatch_size}
         
     def init_GAN(self):
         args, kwargs = self.GAN_params
@@ -141,7 +143,7 @@ class Analyzer():
         self.GAN = StyleGAN2(
             optimizer='adam', lr = 1, lr_mlp = self.lr_mlp, ttur_mult = 1, 
             image_size = self.image_size, network_capacity = self.network_capacity, 
-            fmap_max = self.fmap_max, transparent = self.transparent, num_comm_channels= self.num_comm_channels, num_packs= self.num_packs,
+            fmap_max = self.fmap_max, transparent = self.transparent, comm_capacity=self.comm_capacity, num_packs= self.num_packs, minibatch_size=self.minibatch_size,
             fq_layers = self.fq_layers, fq_dict_size = self.fq_dict_size, attn_layers = self.attn_layers, 
             fp16 = self.fp16, cl_reg = self.cl_reg, no_const = self.no_const, rank = self.rank, 
             *args, **kwargs)
@@ -171,6 +173,7 @@ class Analyzer():
         self.comm_type = config.pop('comm_type', self.comm_type)
         self.comm_papacity = config.pop('comm_capacity', self.comm_capacity)
         self.num_packs = config.pop('num_packs', self.num_packs)
+        self.minibatch_size = config.pop('minibatch_size', self.minibatch_size)
         del self.GAN
         self.init_GAN()
 
@@ -178,7 +181,7 @@ class Analyzer():
         return {'image_size': self.image_size, 'network_capacity': self.network_capacity, 
                 'lr_mlp': self.lr_mlp, 'transparent': self.transparent,
                 'fq_layers': self.fq_layers, 'fq_dict_size': self.fq_dict_size, 'attn_layers': self.attn_layers, 'no_const': self.no_const,
-                'comm_type':self.comm_type, 'comm_capacity':self.comm_capacity, 'num_packs': self.num_packs
+                'comm_type':self.comm_type, 'comm_capacity':self.comm_capacity, 'num_packs': self.num_packs, 'minibatch_size': self.minibatch_size
                 }
         
     def analyse_fid(self, num=-1):
@@ -358,18 +361,18 @@ class Analyzer():
         fake_path1 = self.fid_dir / 'fake1'
         fake_path2 = self.fid_dir / 'fake2'
 
-        fid_scores = []
+        # fid_scores = []
 
-        for i in range(10):
+        rmtree(fake_path1, ignore_errors=True)
+        rmtree(fake_path2, ignore_errors=True)
 
-            rmtree(fake_path1, ignore_errors=True)
-            rmtree(fake_path2, ignore_errors=True)
+        # rename fake_path to fake_path1
+        # os.rename(fake_path, fake_path1)
+        os.mkdir(fake_path1)
+        os.mkdir(fake_path2)
 
-            # rename fake_path to fake_path1
-            # os.rename(fake_path, fake_path1)
-            os.mkdir(fake_path1)
-            os.mkdir(fake_path2)
-
+        intra_fids = []
+        for i in range(5):
             fake1_nums = np.random.choice(num_img, num_img // 2, replace=False)
 
             for i in range(num_img):
@@ -377,12 +380,11 @@ class Analyzer():
                     shutil.copy(str(fake_path / f'{str(i)}.{self.image_extension}'), str(fake_path1 / f'{str(i)}.{self.image_extension}'))
                 else:
                     shutil.copy(str(fake_path / f'{str(i)}.{self.image_extension}'), str(fake_path2 / f'{str(i)}.{self.image_extension}'))
-
-            fid_scores.append(fid_score.calculate_fid_given_paths(paths=[str(fake_path1), str(fake_path2)], batch_size=64, device=self.rank, dims=2048))
-
+                    
+            intra_fids.append(fid_score.calculate_fid_given_paths(paths=[str(fake_path1), str(fake_path2)], batch_size=64, device=self.rank, dims=2048))
 
         # calculate the fid score between fake_path1 and fake_path2
-        return np.mean(fid_scores)
+        return np.mean(intra_fids)
 
     @torch.no_grad()
     def truncate_style(self, tensor, trunc_psi = 0.75):
@@ -478,9 +480,11 @@ class Analyzer():
         #     print(f"loading from version {load_data['version']}")
 
         try:
-            self.GAN.load_state_dict(load_data['GAN'])
+            self.GAN.load_state_dict(load_data['GAN'], strict=False)
             # we don't need discriminator for analysis
             del self.GAN.D
+            del self.GAN.D_aug
+            del self.GAN.D_cl
         except Exception as e:
             print('unable to load save model. please try downgrading the package to the version specified by the saved model')
             raise e
@@ -490,27 +494,55 @@ class Analyzer():
         self.GAN.eval()
 
 if __name__ == '__main__':
-    ArgumentParser.add_argument('--name', type=str)
-    ArgumentParser.add_argument('--data_dir', type=str, default='/home/zichuan/data/img_align_celeba')
-    ArgumentParser.add_argument('--batch_size', type=int, default=32)
-    ArgumentParser.add_argument('--calculate_fid_num_images', type=int, default=6400)
-    ArgumentParser.add_argument('--log', type=bool, default=True)
-    ArgumentParser.add_argument('--num_workers', type=int, default=4)
-    # ArgumentParser.add_argument('--trunc_psi', type=float, default=0)
-    ArgumentParser.add_argument('--rank', type=int, default=1)
+    parser = ArgumentParser()
+    parser.add_argument('--name', type=str, default=None)
+    parser.add_argument('--data_dir', type=str, default='/home/zichuan/data/img_align_celeba')
+    parser.add_argument('--batch_size', type=int, default=32)
+    parser.add_argument('--calculate_fid_num_images', type=int, default=6400)
+    parser.add_argument('--log', type=bool, default=True)
+    parser.add_argument('--num_workers', type=int, default=None)
+    # parser.add_argument('--trunc_psi', type=float, default=0)
+    parser.add_argument('--rank', type=int, default=1)
 
-    arg = ArgumentParser.parse_args()
+    arg = parser.parse_args()
+    
+    # names = ['b32_hinge_cc1', 'b32_bce_pac2', 'b32_bce_pac4', 'b32_dcl_pac2', 'b32_dcl_pac4']
+    names = ['b32_bce_cc1']
+    for name in names:
+        analyzer = Analyzer(
+            name=name,
+            data_dir=arg.data_dir,
+            batch_size=arg.batch_size,
+            calculate_fid_num_images = arg.calculate_fid_num_images,
+            log = arg.log,
+            num_workers = arg.num_workers,
+            # trunc_psi=arg.trunc_psi,
+            rank=arg.rank,
+            clear_fid_cache=True
+        )
+        # to test if the model can be loaded correctly
+        analyzer.load() 
+    
+    
+    with open('/home/zichuan/stylegan2-pytorch/results.csv', 'a') as f:
+        f.write('names, fid, fid_std, intra_fid, intra_fid_std \n')
 
-    analyzer = Analyzer(
-        name= arg.name,
-        data_dir=arg.data_dir,
-        batch_size=arg.batch_size,
-        calculate_fid_num_images = arg.calculate_fid_num_images,
-        log = arg.log,
-        num_workers = arg.num_workers,
-        # trunc_psi=arg.trunc_psi,
-        rank=arg.rank,
-        clear_fid_cache=True
-    )
+    for name in names:
+        analyzer = Analyzer(
+            name=name,
+            data_dir=arg.data_dir,
+            batch_size=arg.batch_size,
+            calculate_fid_num_images = arg.calculate_fid_num_images,
+            log = arg.log,
+            num_workers = arg.num_workers,
+            # trunc_psi=arg.trunc_psi,
+            rank=arg.rank,
+            clear_fid_cache=True
+        )
+        
+        fid, fid_std, intra_fid, intra_fid_std = analyzer.analyse_fid()
+        
+        with open('/home/zichuan/stylegan2-pytorch/results.csv', 'a') as f:
+            f.write(f'{name}, {fid}, {fid_std}, {intra_fid}, {intra_fid_std} \n')
 
-    print(analyzer.analyse_fids())
+     
