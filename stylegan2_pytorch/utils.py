@@ -183,6 +183,19 @@ def exists(val):
     return val is not None
 
 @contextmanager
+def no_grad(*models):
+    for model in models:
+        for param in model.parameters():
+            param.requires_grad = False
+    
+    try:
+        yield None
+    finally:
+        for model in models:
+            for param in model.parameters():
+                param.requires_grad = True
+
+@contextmanager
 def null_context():
     yield
 
