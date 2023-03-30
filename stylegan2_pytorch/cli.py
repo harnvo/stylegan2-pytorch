@@ -80,7 +80,7 @@ def train_from_folder(
     fmap_max = 512,
     transparent = False,
     comm_type = 'mean', comm_capacity = 0, num_packs = 1, minibatch_size=1, # for discriminator only
-    batch_size = 5,
+    batch_size = 32,
     gradient_accumulate_every = 6,
     num_train_steps = 50000,
     learning_rate = 2e-4, lr_mlp = 0.1,
@@ -126,6 +126,8 @@ def train_from_folder(
             name += f"_p{num_packs}"
         if minibatch_size > 1:
             name += f"_mb{minibatch_size}"
+        if ttur_mult != 1.5:
+            name += f"_t{ttur_mult}"
         
     model_args = dict(
         name = name,
