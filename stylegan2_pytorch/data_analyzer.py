@@ -18,6 +18,7 @@ class Analyzer():
         models_dir = 'models',
         base_dir = './',
         data_dir = './data',
+        fid_stats_path = './fid/fid_stats.npz',
         image_size = 128,
         network_capacity = 16,
         fmap_max = 512,
@@ -27,13 +28,11 @@ class Analyzer():
         num_packs=1,            # number of packs.                  For discriminator only.
         minibatch_size=1,       # minibatch size.                   For discriminator only.
         batch_size = 4,
-        gradient_accumulate_every=1,
         num_workers = None,
         num_image_tiles = 8,
         trunc_psi = 0.6,
         fp16 = False,
         cl_reg = False,
-        no_pl_reg = False,
         fq_layers = [],
         fq_dict_size = 256,
         attn_layers = [],
@@ -42,7 +41,7 @@ class Analyzer():
         generator_top_k_gamma = 0.99,
         generator_top_k_frac = 0.5,
         loss_type = 'hinge',
-        calculate_fid_every = None,
+        # calculate_fid_every = None,
         calculate_fid_num_images = 12800,
         clear_fid_cache = False,
         rank = 0,
@@ -91,22 +90,13 @@ class Analyzer():
         self.av = None
         self.trunc_psi = trunc_psi
 
-        self.no_pl_reg = no_pl_reg
-        self.pl_mean = None
-
-        self.gradient_accumulate_every = gradient_accumulate_every
-
         assert not fp16 or fp16 and APEX_AVAILABLE, 'Apex is not available for you to use mixed precision training'
         self.fp16 = fp16
 
         self.cl_reg = cl_reg
 
-        self.pl_length_ma = EMA(0.99)
-        # self.init_folders()
-
-        # self.dataset_aug_prob = dataset_aug_prob
-
-        self.calculate_fid_every = calculate_fid_every
+        # self.pl_length_ma = EMA(0.99)
+        
         self.calculate_fid_num_images = calculate_fid_num_images
         self.clear_fid_cache = clear_fid_cache
 
@@ -121,7 +111,9 @@ class Analyzer():
         self.logger = SummaryWriter(log_dir=self.results_dir / name) if log else None
 
         self.load_config()
-        self.set_data_src(data_dir)
+        self.data_dir = data_dir
+        self.fid_stats_path = fid_stats_path
+        # self.set_data_src(data_dir)
 
     @property
     def image_extension(self):
@@ -184,9 +176,14 @@ class Analyzer():
                 'comm_type':self.comm_type, 'comm_capacity':self.comm_capacity, 'num_packs': self.num_packs, 'minibatch_size': self.minibatch_size
                 }
         
-    def analyse_fid(self, num=-1):
+    def save_fid_stat_for_data(self, batch_size=64):
+        if os.path.exists(self.fid_stats_path):
+            print('FID stats already exist')
+            return
+        fid_score.save_fid_stats(paths=[self.data_dir, self.fid_stats_path], batch_size=batch_size, device=self.rank, dims=2048)
+        
+    def analyse_fid(self, num=-1, num_repetitions=50):
         self.load(num)
-        num_repetitions = 50
         
         fids = []
         intra_fids = []
@@ -200,43 +197,16 @@ class Analyzer():
             os.makedirs(self.results_dir)
         
         with open(self.results_dir / f'{self.name}_fid.txt', 'w') as f:
-            f.write(f'{np.mean(fids)}, {np.std(fids)}, {np.mean(intra_fids)}, {np.std(intra_fids)}\n')
+            f.write(f'{np.mean(fids)}, {np.std(fids)}, {np.mean(intra_fids)}, {np.std(intra_fids)}\n')\
             
         return np.mean(fids), np.std(fids), np.mean(intra_fids), np.std(intra_fids)
-    
-    # def analyse_fids(self, final=True):
-    #     if final:
-    #         self.load()
-    #         fid = self.calculate_fid(num_batches = self.calculate_fid_num_images // self.batch_size)
-    #         intra_fid = self.calculate_intra_fid()
-    #         return fid, intra_fid
-        
-    #     fids = []
-    #     intra_fids = []
-    #     for i in range(self.checkpoint_num):
-    #         self.load(i)
-    #         fid = self.calculate_fid(num_batches = self.calculate_fid_num_images // self.batch_size)
-    #         intra_fid = self.calculate_intra_fid()
-    #         fids.append(fid)
-    #         intra_fids.append(intra_fid)
-    #         if exists(self.logger):
-    #             self.logger.add_scalar('fid', fid, i)
-    #             self.logger.add_scalar('intra_fid', intra_fid, i)
 
-    #         plt.figure(figsize=(10, 5))
-    #         plt.plot(fids, label='fid')
-    #         plt.plot(intra_fids, label='intra_fid')
-    #         plt.legend()
-    #         plt.savefig(self.results_dir / self.name / 'fid.png')
-
-    #     return fids, intra_fids
-
-    def set_data_src(self, folder):
-        # we should not augment the dataset when doing evaluation
-        self.dataset = Dataset(folder, self.image_size, transparent = self.transparent, aug_prob = 0)
-        num_workers = num_workers = default(self.num_workers, NUM_CORES)
-        dataloader = data.DataLoader(self.dataset, num_workers = num_workers, batch_size = self.batch_size, shuffle = True, drop_last = True, pin_memory = True)
-        self.loader = cycle(dataloader)
+    # def set_data_src(self, folder):
+    #     # we should not augment the dataset when doing evaluation
+    #     self.dataset = Dataset(folder, self.image_size, transparent = self.transparent, aug_prob = 0)
+    #     num_workers = num_workers = default(self.num_workers, NUM_CORES)
+    #     dataloader = data.DataLoader(self.dataset, num_workers = num_workers, batch_size = self.batch_size, shuffle = True, drop_last = True, pin_memory = True)
+    #     self.loader = cycle(dataloader)
 
         # # auto set augmentation prob for user if dataset is detected to be low
         # num_samples = len(self.dataset)
@@ -294,20 +264,7 @@ class Analyzer():
         
         torch.cuda.empty_cache()
 
-        real_path = self.fid_dir / 'real'
         fake_path = self.fid_dir / 'fake'
-
-        # remove any existing files used for fid calculation and recreate directories
-
-        if not real_path.exists() or self.clear_fid_cache:
-            rmtree(real_path, ignore_errors=True)
-            os.makedirs(real_path)
-
-            for batch_num in tqdm(range(num_batches), desc='calculating FID - saving reals'):
-                real_batch = next(self.loader)
-                for k, image in enumerate(real_batch.unbind(0)):
-                    filename = str(k + batch_num * self.batch_size)
-                    torchvision.utils.save_image(image, str(real_path / f'{filename}.png'))
 
         # generate a bunch of fake images in results / name / fid_fake
 
@@ -317,19 +274,9 @@ class Analyzer():
         self.GAN.eval()
         ext = self.image_extension
 
-
-
         latent_dim = self.GAN.G.latent_dim
         image_size = self.GAN.G.image_size
         num_layers = self.GAN.G.num_layers
-
-        # style = noise_list(batch_size, num_layers, latent_dim, device=self.rank)
-        # noise = image_noise(batch_size, image_size, device=self.rank)
-
-        # w_space = latent_to_w(self.GAN.S, style)
-        # w_styles = styles_def_to_tensor(w_space)
-
-        # generated_images = self.GAN.G(w_styles, noise)
 
         for batch_num in tqdm(range(num_batches), desc='calculating FID - saving generated'):
             # latents and noise
@@ -341,14 +288,20 @@ class Analyzer():
             w_styles = styles_def_to_tensor(w_space)
 
             generated_images = self.GAN.GE(w_styles, noise)
-            # generated_images = self.generate_truncated(self.GAN.SE, self.GAN.GE, latents, noise, trunc_psi = self.trunc_psi)
-
-            # torchvision.utils.save_image(generated_images, str(self.results_dir / self.name / f'{str(num)}.{ext}'), nrow=num_rows)
 
             for j, image in enumerate(generated_images.unbind(0)):
                 torchvision.utils.save_image(image, str(fake_path / f'{str(j + batch_num * self.batch_size)}.{ext}'))
 
-        return fid_score.calculate_fid_given_paths(paths=[str(real_path), str(fake_path)], batch_size=64, device=noise.device, dims=2048)
+        with np.load(self.fid_stats_path) as f:
+            m1, s1 = f['mu'][:], f['sigma'][:]
+            
+        dims = 2048
+        block_idx = fid_score.InceptionV3.BLOCK_INDEX_BY_DIM[dims]
+        model = fid_score.InceptionV3([block_idx]).to(self.rank)
+        
+        m2, s2 = fid_score.compute_statistics_of_path(str(fake_path), model, self.batch_size, dims, self.rank)
+        
+        return fid_score.calculate_frechet_distance(m1, s1, m2, s2)
 
     @torch.no_grad()
     def calculate_intra_fid(self):
@@ -359,33 +312,41 @@ class Analyzer():
 
         # split the fake images into two sets
         fake_path1 = self.fid_dir / 'fake1'
-        fake_path2 = self.fid_dir / 'fake2'
+        # fake_path2 = self.fid_dir / 'fake2'
 
         # fid_scores = []
 
         rmtree(fake_path1, ignore_errors=True)
-        rmtree(fake_path2, ignore_errors=True)
+        # rmtree(fake_path2, ignore_errors=True)
 
         # rename fake_path to fake_path1
         # os.rename(fake_path, fake_path1)
         os.mkdir(fake_path1)
-        os.mkdir(fake_path2)
 
-        intra_fids = []
-        for i in range(5):
-            fake1_nums = np.random.choice(num_img, num_img // 2, replace=False)
+        self.GAN.eval()
+        ext = self.image_extension
 
-            for i in range(num_img):
-                if i in fake1_nums:
-                    shutil.copy(str(fake_path / f'{str(i)}.{self.image_extension}'), str(fake_path1 / f'{str(i)}.{self.image_extension}'))
-                else:
-                    shutil.copy(str(fake_path / f'{str(i)}.{self.image_extension}'), str(fake_path2 / f'{str(i)}.{self.image_extension}'))
-                    
-            intra_fids.append(fid_score.calculate_fid_given_paths(paths=[str(fake_path1), str(fake_path2)], batch_size=64, device=self.rank, dims=2048))
+        latent_dim = self.GAN.G.latent_dim
+        image_size = self.GAN.G.image_size
+        num_layers = self.GAN.G.num_layers
+        
+        # generate another batch of fake images
+        for batch_num in tqdm(range(num_img // self.batch_size), desc='calculating FID - saving generated'):
+            # latents and noise
+            latents = noise_list(self.batch_size, num_layers, latent_dim, device=self.rank)
+            noise = image_noise(self.batch_size, image_size, device=self.rank)
 
-        # calculate the fid score between fake_path1 and fake_path2
-        return np.mean(intra_fids)
+            # moving averages
+            w_space = latent_to_w(self.GAN.SE, latents)
+            w_styles = styles_def_to_tensor(w_space)
 
+            generated_images = self.GAN.GE(w_styles, noise)
+
+            for j, image in enumerate(generated_images.unbind(0)):
+                torchvision.utils.save_image(image, str(fake_path1 / f'{str(j + batch_num * self.batch_size)}.{ext}'))
+                
+        return fid_score.calculate_fid_given_paths([str(fake_path), str(fake_path1)], self.batch_size, self.rank, 2048)
+        
     @torch.no_grad()
     def truncate_style(self, tensor, trunc_psi = 0.75):
         S = self.GAN.S
@@ -496,9 +457,10 @@ class Analyzer():
 if __name__ == '__main__':
     parser = ArgumentParser()
     parser.add_argument('--name', type=str, default=None)
-    parser.add_argument('--data_dir', type=str, default='/home/zichuan/data/img_align_celeba')
+    parser.add_argument('--data_dir', type=str, default='../data/img_align_celeba')
+    parser.add_argument('--fid_stats_path', type=str, default='./fid_stats_celeba.npz')
     parser.add_argument('--batch_size', type=int, default=32)
-    parser.add_argument('--calculate_fid_num_images', type=int, default=6400)
+    parser.add_argument('--calculate_fid_num_images', type=int, default=12800)
     parser.add_argument('--log', type=bool, default=True)
     parser.add_argument('--num_workers', type=int, default=None)
     # parser.add_argument('--trunc_psi', type=float, default=0)
@@ -506,12 +468,14 @@ if __name__ == '__main__':
 
     arg = parser.parse_args()
     
-    # names = ['b32_hinge_cc1', 'b32_bce_pac2', 'b32_bce_pac4', 'b32_dcl_pac2', 'b32_dcl_pac4']
-    names = ['b32_bce_cc1']
+    # names = ['b32_bce_mb8', 'b32_bce_pac2', 'b32_bce_pac4', 'b32_dcl_pac2', 'b32_dcl_pac4', 'b32_bce_cc1sharpen', 'b32_bce', 'b32_dcl_pac4']
+    # names = ['b32_bce_cc1']
+    names = ['b32_bce', 'b32_bce_t0.5']
     for name in names:
         analyzer = Analyzer(
             name=name,
             data_dir=arg.data_dir,
+            fid_stats_path=arg.fid_stats_path,
             batch_size=arg.batch_size,
             calculate_fid_num_images = arg.calculate_fid_num_images,
             log = arg.log,
@@ -522,15 +486,17 @@ if __name__ == '__main__':
         )
         # to test if the model can be loaded correctly
         analyzer.load() 
+        
+    analyzer.save_fid_stat_for_data(batch_size=512)
     
-    
-    with open('/home/zichuan/stylegan2-pytorch/results.csv', 'a') as f:
+    with open('./results.csv', 'a') as f:
         f.write('names, fid, fid_std, intra_fid, intra_fid_std \n')
 
     for name in names:
         analyzer = Analyzer(
             name=name,
             data_dir=arg.data_dir,
+            fid_stats_path=arg.fid_stats_path,
             batch_size=arg.batch_size,
             calculate_fid_num_images = arg.calculate_fid_num_images,
             log = arg.log,
@@ -540,9 +506,9 @@ if __name__ == '__main__':
             clear_fid_cache=True
         )
         
-        fid, fid_std, intra_fid, intra_fid_std = analyzer.analyse_fid()
+        fid, fid_std, intra_fid, intra_fid_std = analyzer.analyse_fid(num_repetitions=5)
         
-        with open('/home/zichuan/stylegan2-pytorch/results.csv', 'a') as f:
+        with open('./results.csv', 'a') as f:
             f.write(f'{name}, {fid}, {fid_std}, {intra_fid}, {intra_fid_std} \n')
 
      
