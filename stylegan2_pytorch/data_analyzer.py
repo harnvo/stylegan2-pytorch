@@ -163,7 +163,7 @@ class Analyzer():
         self.no_const = config.pop('no_const', False)
         self.lr_mlp = config.pop('lr_mlp', 0.1)
         self.comm_type = config.pop('comm_type', self.comm_type)
-        self.comm_papacity = config.pop('comm_capacity', self.comm_capacity)
+        self.comm_capacity = config.pop('comm_capacity', self.comm_capacity)
         self.num_packs = config.pop('num_packs', self.num_packs)
         self.minibatch_size = config.pop('minibatch_size', self.minibatch_size)
         del self.GAN
@@ -458,6 +458,7 @@ if __name__ == '__main__':
     parser = ArgumentParser()
     parser.add_argument('--name', type=str, default=None)
     parser.add_argument('--data_dir', type=str, default='../data/img_align_celeba')
+    parser.add_argument('--models_dir', type=str, default='./models_bce')
     parser.add_argument('--fid_stats_path', type=str, default='./fid_stats_celeba.npz')
     parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--calculate_fid_num_images', type=int, default=12800)
@@ -468,13 +469,16 @@ if __name__ == '__main__':
 
     arg = parser.parse_args()
     
-    # names = ['b32_bce_mb8', 'b32_bce_pac2', 'b32_bce_pac4', 'b32_dcl_pac2', 'b32_dcl_pac4', 'b32_bce_cc1sharpen', 'b32_bce', 'b32_dcl_pac4']
-    # names = ['b32_bce_cc1']
-    names = ['b32_bce', 'b32_bce_t0.5']
+    # names = ['b32_bce_mb8', 'b32_bce_p2', 'b32_bce_p4', 'b32_bce_cc1sharpen', 'b32_bce_cc1', 'b32_bce']
+    # names = ['b32_bce', 'b32_bce_t0.5']
+    # names = ['b32_hinge', 'b32_hinge_cc1sharpen', 'b32_hinge_mb8', 'b32_hinge_p2', 'b32_hinge_p4', 'b32_hinge_cc1']
+    # names = ['b32_dual_contrast_p2', 'b32_dual_contrast_p4']
+    names = ['b32_dual_contrast_cc1sharpen']
     for name in names:
         analyzer = Analyzer(
             name=name,
             data_dir=arg.data_dir,
+            models_dir=arg.models_dir,
             fid_stats_path=arg.fid_stats_path,
             batch_size=arg.batch_size,
             calculate_fid_num_images = arg.calculate_fid_num_images,
@@ -495,7 +499,9 @@ if __name__ == '__main__':
     for name in names:
         analyzer = Analyzer(
             name=name,
+            
             data_dir=arg.data_dir,
+            models_dir=arg.models_dir,
             fid_stats_path=arg.fid_stats_path,
             batch_size=arg.batch_size,
             calculate_fid_num_images = arg.calculate_fid_num_images,
@@ -506,7 +512,7 @@ if __name__ == '__main__':
             clear_fid_cache=True
         )
         
-        fid, fid_std, intra_fid, intra_fid_std = analyzer.analyse_fid(num_repetitions=5)
+        fid, fid_std, intra_fid, intra_fid_std = analyzer.analyse_fid(num_repetitions=50)
         
         with open('./results.csv', 'a') as f:
             f.write(f'{name}, {fid}, {fid_std}, {intra_fid}, {intra_fid_std} \n')
