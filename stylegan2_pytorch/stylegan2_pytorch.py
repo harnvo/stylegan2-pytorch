@@ -46,50 +46,21 @@ class MinibatchBlock(nn.Module):
 
 class CommConv(nn.Module):
     def __new__(cls, win_size=3, n_dim=2, comm_type='mean'):
-        assert comm_type in ['mean', 'sharpen', 'maxpool'], "comm_type must be 'mean', 'sharpen', or 'maxpool'."
+        assert comm_type in ['mean', 'sharpen', 'maxpool', 'learned'], "comm_type must be 'mean', 'sharpen', or 'maxpool'."
         assert win_size % 2 == 1, "win_size must be odd."
        
-        if n_dim == 1:
-            return CommConv2D(win_size, comm_type=comm_type)
-        elif n_dim == 2:
+        if n_dim == 2:
             return CommConv3D(win_size, comm_type=comm_type)
         elif n_dim == 3:
             return CommConv4D(win_size, comm_type=comm_type)
         else:
-            raise ValueError(f"n_dim must be 1, 2, or 3, but got {n_dim}.")
+            raise ValueError(f"n_dim must be 2, or 3, but got {n_dim}.")
    
     def forward(self, x):
         raise NotImplementedError
         # return self.conv(
         #     F.pad(x.unsqueeze(0), (self.conv.padding[0],)*2, mode=self.padding_mode)
         #     ).squeeze(0)
-
-class CommConv2D(nn.Module):
-    def __init__(self, win_size=3, comm_type='mean') -> None:
-        super().__init__()
-        self.pad_size = (win_size-1)//2
-
-        if comm_type == 'mean':
-            self.conv = nn.Conv2d(1, 1, (win_size, 1), bias=False)
-            self.conv.requires_grad_(False)
-            self.conv.weight.data = torch.ones_like(self.conv.weight.data)/win_size
-        elif comm_type == 'sharpen':
-            self.conv = nn.Conv2d(1, 1, (win_size, 1), bias=False)
-            self.conv.requires_grad_(False)
-            self.conv.weight.data =-torch.ones_like(self.conv.weight.data)/win_size
-            self.conv.weight.data[:,:,win_size//2] += 1
-        elif comm_type == 'maxpool':
-            self.conv = nn.MaxPool2d((win_size,1), stride=1)
-        else:
-            raise NotImplementedError
-
-        # register this module as a buffer
-        self.register_buffer('weight', self.conv.weight.data)
-
-    def forward(self, x):
-        # circular padding
-        x = torch.cat([x[-self.pad_size:,:], x, x[:self.pad_size,:]], dim=0)
-        return self.conv(x.unsqueeze(0)).squeeze(0)
 
 class CommConv3D(nn.Module):
     def __init__(self, win_size=3, comm_type='mean') -> None:
@@ -107,6 +78,8 @@ class CommConv3D(nn.Module):
             self.conv.weight.data[:,:,win_size//2] += 1
         elif comm_type == 'maxpool':
             self.conv = nn.MaxPool3d((win_size,1,1), stride=1)
+        elif comm_type == 'learned':
+            self.conv = nn.Conv3d(1, 1, (win_size, 1, 1))
         else:
             raise NotImplementedError
 
@@ -124,16 +97,18 @@ class CommConv4D(nn.Module):
         self.pad_size = (win_size-1)//2
 
         if comm_type == 'mean':
-            self.conv = nn.Conv3d(1, 1, (3, 1, 1), bias=False)
+            self.conv = nn.Conv3d(1, 1, (win_size, 1, 1), bias=False)
             self.conv.requires_grad_(False)
             self.conv.weight.data = torch.ones_like(self.conv.weight.data)/win_size
         elif comm_type == 'sharpen':
-            self.conv = nn.Conv3d(1, 1, (3, 1, 1), bias=False)
+            self.conv = nn.Conv3d(1, 1, (win_size, 1, 1), bias=False)
             self.conv.requires_grad_(False)
             self.conv.weight.data =-torch.ones_like(self.conv.weight.data)/win_size
             self.conv.weight.data[:,:,win_size//2] += 1
         elif comm_type == 'maxpool':
-            self.conv = nn.MaxPool3d((3,1,1), stride=1)
+            self.conv = nn.MaxPool3d((win_size,1,1), stride=1)
+        elif comm_type == 'learned':
+            self.conv = nn.Conv3d(1, 1, (win_size, 1, 1))
         else:
             raise NotImplementedError
 
@@ -497,7 +472,7 @@ class StyleGAN2(nn.Module):
         comm_type='mean', comm_capacity=0, num_packs=1, minibatch_size=1,
         cl_reg = False, 
         steps = 1, 
-        optimizer = 'adam', lr = 1e-4, ttur_mult = 2, # for optimizers
+        lr = 1e-4, ttur_mult = 2, betas = (0.5, 0.9), # for optimizers
         fq_layers = [], 
         fq_dict_size = 256, 
         attn_layers = [], 
@@ -507,7 +482,7 @@ class StyleGAN2(nn.Module):
         ):
         super().__init__()
         assert not cl_reg, "contrastive learning disabled for this project"
-        assert optimizer in ['adam', 'sgd', 'RMSprop'], "optimizer must be one of adam, sgd, RMSprop"
+        # assert optimizer in ['adam', 'sgd', 'RMSprop'], "optimizer must be one of adam, sgd, RMSprop"
         assert isinstance(rank, int) and rank >= 0, "rank must be a non-negative integer"
 
         self.lr = lr
@@ -539,19 +514,19 @@ class StyleGAN2(nn.Module):
 
         # init optimizers
         generator_params = list(self.G.parameters()) + list(self.S.parameters())
-        if optimizer == 'adam':
-            self.G_opt = Adam(generator_params, lr = self.lr, betas=(0.5, 0.9))
-            self.D_opt = Adam(self.D.parameters(), lr = self.lr * ttur_mult, betas=(0.5, 0.9))
-        elif optimizer == 'sgd':
-            self.G_opt = SGD(generator_params, lr = self.lr, momentum=0.9)
-            self.D_opt = SGD(self.D.parameters(), lr = self.lr * ttur_mult, momentum=0.9)
-        elif optimizer == 'RMSprop':
-            self.G_opt = RMSprop(generator_params, lr = self.lr)
-            self.D_opt = RMSprop(self.D.parameters(), lr = self.lr * ttur_mult)
-        else:
-            raise ValueError('optimizer must be adam, sgd, or RMSprop')
-        # self.G_opt = Adam(generator_params, lr = self.lr, betas=(0.5, 0.9))
-        # self.D_opt = Adam(self.D.parameters(), lr = self.lr * ttur_mult, betas=(0.5, 0.9))
+        # if optimizer == 'adam':
+        #     self.G_opt = Adam(generator_params, lr = self.lr, betas=(0.5, 0.9))
+        #     self.D_opt = Adam(self.D.parameters(), lr = self.lr * ttur_mult, betas=(0.5, 0.9))
+        # elif optimizer == 'sgd':
+        #     self.G_opt = SGD(generator_params, lr = self.lr, momentum=0.9)
+        #     self.D_opt = SGD(self.D.parameters(), lr = self.lr * ttur_mult, momentum=0.9)
+        # elif optimizer == 'RMSprop':
+        #     self.G_opt = RMSprop(generator_params, lr = self.lr)
+        #     self.D_opt = RMSprop(self.D.parameters(), lr = self.lr * ttur_mult)
+        # else:
+        #     raise ValueError('optimizer must be adam, sgd, or RMSprop')
+        self.G_opt = Adam(generator_params, lr = self.lr, betas=betas)
+        self.D_opt = Adam(self.D.parameters(), lr = self.lr * ttur_mult, betas=betas)
 
         # init weights
         self._init_weights()
@@ -608,6 +583,7 @@ class Trainer():
         minibatch_size = 4,      # minibase size.                    For discriminator only.
         batch_size = 4,
         mixed_prob = 0.9,
+        n_critic = 1,
         gradient_accumulate_every=1,
         lr = 2e-4, lr_mlp = 0.1, ttur_mult = 2, # for optimizers
         rel_disc_loss = False,
@@ -701,6 +677,7 @@ class Trainer():
         self.no_pl_reg = no_pl_reg
         self.pl_mean = None
 
+        self.n_critic = n_critic
         self.gradient_accumulate_every = gradient_accumulate_every
 
         assert not fp16 or fp16 and APEX_AVAILABLE, 'Apex is not available for you to use mixed precision training'
@@ -756,9 +733,10 @@ class Trainer():
     def init_GAN(self):
         args, kwargs = self.GAN_params
 
-        optimizer = 'RMSprop' if self.loss_type == 'wasserstein' else 'adam'
+        # optimizer = 'RMSprop' if self.loss_type == 'wasserstein' else 'adam'
+        betas = (0, 0.9) if self.loss_type == 'wasserstein' else (0.5, 0.9)
         self.GAN = StyleGAN2(
-            optimizer=optimizer ,lr = self.lr, lr_mlp = self.lr_mlp, ttur_mult = self.ttur_mult, 
+            lr = self.lr, lr_mlp = self.lr_mlp, ttur_mult = self.ttur_mult, betas=betas,
             image_size = self.image_size, network_capacity = self.network_capacity, 
             fmap_max = self.fmap_max, transparent = self.transparent, 
             comm_type=self.comm_type, comm_capacity=self.comm_capacity, num_packs= self.num_packs, minibatch_size=self.minibatch_size,
@@ -841,7 +819,7 @@ class Trainer():
         aug_types  = self.aug_types
         aug_kwargs = {'prob': aug_prob, 'types': aug_types}
 
-        apply_gradient_penalty = self.steps % 4 == 0
+        apply_gradient_penalty = (self.steps % 4 == 0) if self.loss_type != 'wasserstein' else True
         apply_path_penalty = not self.no_pl_reg and self.steps > 5000 and self.steps % 32 == 0
         apply_cl_reg_to_generated = self.steps > 20000
 
@@ -881,10 +859,6 @@ class Trainer():
             backwards(loss, self.GAN.D_opt, loss_id = 0)
 
             self.GAN.D_opt.step()
-
-            if self.loss_type == 'wsserstein':
-                for p in D.parameters():
-                    p.data.clamp_(-0.01, 0.01)
 
         # setup losses
         if self.loss_type == 'hinge':
@@ -968,82 +942,78 @@ class Trainer():
 
             self.GAN.D_opt.step()
 
-            if self.loss_type == 'wsserstein':
-                for p in D.parameters():
-                    p.data.clamp_(-0.01, 0.01)
-
         # train generator
-        with no_grad(D_aug):
-            self.GAN.G_opt.zero_grad()
+        if self.steps % self.n_critic == 0:
+            with no_grad(D_aug):
+                self.GAN.G_opt.zero_grad()
+                for i in gradient_accumulate_contexts(self.gradient_accumulate_every):
+                    style = get_latents_fn(batch_size, num_layers, latent_dim, device=self.rank)
+                    noise = image_noise(batch_size, image_size, device=self.rank)
 
-            for i in gradient_accumulate_contexts(self.gradient_accumulate_every):
-                style = get_latents_fn(batch_size, num_layers, latent_dim, device=self.rank)
-                noise = image_noise(batch_size, image_size, device=self.rank)
+                    
+                    w_space = latent_to_w(S, style)
+                    w_styles = styles_def_to_tensor(w_space)
 
-                
-                w_space = latent_to_w(S, style)
-                w_styles = styles_def_to_tensor(w_space)
+                    generated_images = G(w_styles, noise)
+                    fake_output, _ = D_aug(generated_images, **aug_kwargs)
+                    fake_output_loss = fake_output
 
-                generated_images = G(w_styles, noise)
-                fake_output, _ = D_aug(generated_images, **aug_kwargs)
-                fake_output_loss = fake_output
+                    real_output = None
+                    if G_requires_reals:
+                        image_batch = next(self.loader).cuda(self.rank)
+                        real_output, _ = D_aug(image_batch, detach = True, **aug_kwargs)
+                        real_output = real_output.detach()
 
-                real_output = None
-                if G_requires_reals:
-                    image_batch = next(self.loader).cuda(self.rank)
-                    real_output, _ = D_aug(image_batch, detach = True, **aug_kwargs)
-                    real_output = real_output.detach()
+                    if self.top_k_training:
+                        epochs = (self.steps * batch_size * self.gradient_accumulate_every) / len(self.dataset)
+                        k_frac = max(self.generator_top_k_gamma ** epochs, self.generator_top_k_frac)
+                        k = math.ceil(batch_size * k_frac)
 
-                if self.top_k_training:
-                    epochs = (self.steps * batch_size * self.gradient_accumulate_every) / len(self.dataset)
-                    k_frac = max(self.generator_top_k_gamma ** epochs, self.generator_top_k_frac)
-                    k = math.ceil(batch_size * k_frac)
+                        if k != batch_size:
+                            fake_output_loss, _ = fake_output_loss.topk(k=k, largest=False)
 
-                    if k != batch_size:
-                        fake_output_loss, _ = fake_output_loss.topk(k=k, largest=False)
+                    loss = G_loss_fn(fake_output_loss, real_output)
+                    gen_loss = loss
 
-                loss = G_loss_fn(fake_output_loss, real_output)
-                gen_loss = loss
+                    if apply_path_penalty:
+                        pl_lengths = calc_pl_lengths(w_styles, generated_images)
+                        avg_pl_length = np.mean(pl_lengths.detach().cpu().numpy())
 
-                if apply_path_penalty:
-                    pl_lengths = calc_pl_lengths(w_styles, generated_images)
-                    avg_pl_length = np.mean(pl_lengths.detach().cpu().numpy())
+                        if not is_empty(self.pl_mean):
+                            pl_loss = ((pl_lengths - self.pl_mean) ** 2).mean()
+                            if not torch.isnan(pl_loss):
+                                gen_loss = gen_loss + pl_loss
 
-                    if not is_empty(self.pl_mean):
-                        pl_loss = ((pl_lengths - self.pl_mean) ** 2).mean()
-                        if not torch.isnan(pl_loss):
-                            gen_loss = gen_loss + pl_loss
+                    gen_loss = gen_loss / self.gradient_accumulate_every
+                    gen_loss.register_hook(raise_if_nan)
+                    backwards(gen_loss, self.GAN.G_opt, loss_id = 2)
+                    del gen_loss
 
-                gen_loss = gen_loss / self.gradient_accumulate_every
-                gen_loss.register_hook(raise_if_nan)
-                backwards(gen_loss, self.GAN.G_opt, loss_id = 2)
-                del gen_loss
+                    total_gen_loss += loss.detach().item() / self.gradient_accumulate_every
 
-                total_gen_loss += loss.detach().item() / self.gradient_accumulate_every
+                self.g_loss = float(total_gen_loss)
+                self.track(self.g_loss, 'G')
 
-            self.g_loss = float(total_gen_loss)
-            self.track(self.g_loss, 'G')
+                self.GAN.G_opt.step()
 
-            self.GAN.G_opt.step()
+        # calculate moving averages
 
-            # calculate moving averages
+        if apply_path_penalty and not np.isnan(avg_pl_length):
+            self.pl_mean = self.pl_length_ma.update_average(self.pl_mean, avg_pl_length)
+            self.track(self.pl_mean, 'PL')
 
-            if apply_path_penalty and not np.isnan(avg_pl_length):
-                self.pl_mean = self.pl_length_ma.update_average(self.pl_mean, avg_pl_length)
-                self.track(self.pl_mean, 'PL')
+        if self.steps % 10 == 0 and self.steps > 20000:
+            self.GAN.EMA()
 
-            if self.steps % 10 == 0 and self.steps > 20000:
-                self.GAN.EMA()
+        if self.steps <= 25000 and self.steps % 1000 == 2:
+            self.GAN.reset_parameter_averaging()
 
-            if self.steps <= 25000 and self.steps % 1000 == 2:
-                self.GAN.reset_parameter_averaging()
+        # save from NaN errors
 
-            # save from NaN errors
-
-            if any(torch.isnan(l) for l in (total_gen_loss, total_disc_loss)):
-                print(f'NaN detected for generator or discriminator. Loading from checkpoint #{self.checkpoint_num}')
-                self.load(self.checkpoint_num)
-                raise NanException
+        if any(torch.isnan(l) for l in (total_gen_loss, total_disc_loss)):
+            print(f'NaN detected for generator or discriminator. Loading from checkpoint #{self.checkpoint_num}')
+            self.load(self.checkpoint_num)
+            raise NanException
 
         # periodically save results
 

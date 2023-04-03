@@ -81,6 +81,7 @@ def train_from_folder(
     transparent = False,
     comm_type = 'mean', comm_capacity = 0, num_packs = 1, minibatch_size=1, # for discriminator only
     batch_size = 32,
+    n_critic = 1,
     gradient_accumulate_every = 6,
     num_train_steps = 50000,
     learning_rate = 2e-4, lr_mlp = 0.1,
@@ -134,6 +135,7 @@ def train_from_folder(
         results_dir = results_dir,
         models_dir = models_dir,
         batch_size = batch_size,
+        n_critic = n_critic,
         gradient_accumulate_every = gradient_accumulate_every,
         image_size = image_size,
         network_capacity = network_capacity,
