@@ -340,7 +340,7 @@ def gen_w_loss(fake, real):
     return -fake.mean()
 
 def w_loss(real, fake):
-    return real.mean() - fake.mean()
+    return fake.mean() - real.mean()
 
 # dataset
 
