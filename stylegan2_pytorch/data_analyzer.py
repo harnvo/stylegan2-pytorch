@@ -30,7 +30,7 @@ class Analyzer():
         batch_size = 4,
         num_workers = None,
         num_image_tiles = 8,
-        trunc_psi = 0.6,
+        trunc_psi = 0.75,
         fp16 = False,
         cl_reg = False,
         fq_layers = [],
@@ -131,9 +131,9 @@ class Analyzer():
     def init_GAN(self):
         args, kwargs = self.GAN_params
 
-        # here optimizer, lr, lr_mlp, ttur_mult no longer matters.
+        # here optimizer, lr, lr_mlp, ttur_mult, betas no longer matters.
         self.GAN = StyleGAN2(
-            optimizer='adam', lr = 1, lr_mlp = self.lr_mlp, ttur_mult = 1, 
+            lr = 1, lr_mlp = self.lr_mlp, ttur_mult = 1, betas = (0.0, 0.99),
             image_size = self.image_size, network_capacity = self.network_capacity, 
             fmap_max = self.fmap_max, transparent = self.transparent, comm_capacity=self.comm_capacity, num_packs= self.num_packs, minibatch_size=self.minibatch_size,
             fq_layers = self.fq_layers, fq_dict_size = self.fq_dict_size, attn_layers = self.attn_layers, 
@@ -200,6 +200,11 @@ class Analyzer():
             f.write(f'{np.mean(fids)}, {np.std(fids)}, {np.mean(intra_fids)}, {np.std(intra_fids)}\n')\
             
         return np.mean(fids), np.std(fids), np.mean(intra_fids), np.std(intra_fids)
+    
+    def num_parameters(self):
+        gen_para = sum(p.numel() for p in self.GAN.G.parameters() if p.requires_grad)+sum(p.numel() for p in self.GAN.S.parameters() if p.requires_grad)
+        disc_para = sum(p.numel() for p in self.GAN.D.parameters() if p.requires_grad)
+        return gen_para, disc_para
 
     # def set_data_src(self, folder):
     #     # we should not augment the dataset when doing evaluation
@@ -284,10 +289,7 @@ class Analyzer():
             noise = image_noise(self.batch_size, image_size, device=self.rank)
 
             # moving averages
-            w_space = latent_to_w(self.GAN.SE, latents)
-            w_styles = styles_def_to_tensor(w_space)
-
-            generated_images = self.GAN.GE(w_styles, noise)
+            generated_images = self.generate_truncated(self.GAN.SE, self.GAN.GE, latents, noise, trunc_psi = self.trunc_psi)
 
             for j, image in enumerate(generated_images.unbind(0)):
                 torchvision.utils.save_image(image, str(fake_path / f'{str(j + batch_num * self.batch_size)}.{ext}'))
@@ -456,7 +458,7 @@ class Analyzer():
 
 if __name__ == '__main__':
     parser = ArgumentParser()
-    parser.add_argument('--name', type=str, default=None)
+    parser.add_argument('-n','--names', nargs='+', help='names of the models', required=True, default='b32_wasserstein_t1')
     parser.add_argument('--data_dir', type=str, default='../data/img_align_celeba')
     parser.add_argument('--models_dir', type=str, default='./models_bce')
     parser.add_argument('--fid_stats_path', type=str, default='./fid_stats_celeba.npz')
@@ -464,17 +466,12 @@ if __name__ == '__main__':
     parser.add_argument('--calculate_fid_num_images', type=int, default=12800)
     parser.add_argument('--log', type=bool, default=True)
     parser.add_argument('--num_workers', type=int, default=None)
-    # parser.add_argument('--trunc_psi', type=float, default=0)
+    parser.add_argument('--trunc_psi', type=float, default=0.75)
     parser.add_argument('--rank', type=int, default=1)
 
     arg = parser.parse_args()
     
-    # names = ['b32_bce_mb8', 'b32_bce_p2', 'b32_bce_p4', 'b32_bce_cc1sharpen', 'b32_bce_cc1', 'b32_bce']
-    # names = ['b32_bce', 'b32_bce_t0.5']
-    # names = ['b32_hinge', 'b32_hinge_cc1sharpen', 'b32_hinge_mb8', 'b32_hinge_p2', 'b32_hinge_p4', 'b32_hinge_cc1']
-    # names = ['b32_dual_contrast_p2', 'b32_dual_contrast_p4']
-    names = ['b32_dual_contrast_cc1sharpen']
-    for name in names:
+    for name in arg.names:
         analyzer = Analyzer(
             name=name,
             data_dir=arg.data_dir,
@@ -484,19 +481,20 @@ if __name__ == '__main__':
             calculate_fid_num_images = arg.calculate_fid_num_images,
             log = arg.log,
             num_workers = arg.num_workers,
-            # trunc_psi=arg.trunc_psi,
+            trunc_psi=arg.trunc_psi,
             rank=arg.rank,
             clear_fid_cache=True
         )
         # to test if the model can be loaded correctly
         analyzer.load() 
+        print(analyzer.num_parameters())
         
     analyzer.save_fid_stat_for_data(batch_size=512)
     
     with open('./results.csv', 'a') as f:
         f.write('names, fid, fid_std, intra_fid, intra_fid_std \n')
 
-    for name in names:
+    for name in arg.names:
         analyzer = Analyzer(
             name=name,
             
@@ -512,7 +510,7 @@ if __name__ == '__main__':
             clear_fid_cache=True
         )
         
-        fid, fid_std, intra_fid, intra_fid_std = analyzer.analyse_fid(num_repetitions=50)
+        fid, fid_std, intra_fid, intra_fid_std = analyzer.analyse_fid(num_repetitions=2)
         
         with open('./results.csv', 'a') as f:
             f.write(f'{name}, {fid}, {fid_std}, {intra_fid}, {intra_fid_std} \n')
