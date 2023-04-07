@@ -51,7 +51,8 @@ assert torch.cuda.is_available(), 'You need to have an Nvidia GPU with CUDA inst
 # constants
 
 NUM_CORES = multiprocessing.cpu_count()
-EXTS = ['jpg', 'jpeg', 'png']
+# support webp for lsun
+EXTS = ['jpg', 'jpeg', 'png', 'webp']
 
 # helper classes
 
@@ -178,6 +179,10 @@ attn_and_ff = lambda chan: nn.Sequential(*[
 ])
 
 # helpers
+
+def count_parameters(model): 
+    # this is to count the number of parameters in a model
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 def exists(val):
     return val is not None

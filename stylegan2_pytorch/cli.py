@@ -79,7 +79,7 @@ def train_from_folder(
     network_capacity = 16,
     fmap_max = 512,
     transparent = False,
-    comm_type = 'mean', comm_capacity = 0, num_packs = 1, minibatch_size=1, # for discriminator only
+    comm_type = 'mean', comm_capacity = 0, num_packs = 1, minibatch_size=1, minibatch_type='stddev', # for discriminator only
     batch_size = 32,
     n_critic = 1,
     gradient_accumulate_every = 6,
@@ -116,7 +116,8 @@ def train_from_folder(
     calculate_fid_num_images = 12800,
     clear_fid_cache = False,
     seed = 42,
-    log = False
+    log = False,
+    audatious = False
 ):
     if name == 'default':
         name = f"b{batch_size}_{loss_type}"
@@ -127,6 +128,7 @@ def train_from_folder(
             name += f"_p{num_packs}"
         if minibatch_size > 1:
             name += f"_mb{minibatch_size}"
+            name += 'stddev' if minibatch_type == 'stddev' else ''
         if ttur_mult != 1.5:
             name += f"_t{ttur_mult}"
         
@@ -141,7 +143,7 @@ def train_from_folder(
         network_capacity = network_capacity,
         fmap_max = fmap_max,
         transparent = transparent,
-        comm_type = comm_type, comm_capacity = comm_capacity, num_packs = num_packs, minibatch_size = minibatch_size,
+        comm_type = comm_type, comm_capacity = comm_capacity, num_packs = num_packs, minibatch_size = minibatch_size, minibatch_type = 'stddev',
         lr = learning_rate, lr_mlp = lr_mlp,
         ttur_mult = ttur_mult,
         rel_disc_loss = rel_disc_loss,
@@ -168,7 +170,8 @@ def train_from_folder(
         calculate_fid_num_images = calculate_fid_num_images,
         clear_fid_cache = clear_fid_cache,
         mixed_prob = mixed_prob,
-        log = log
+        log = log,
+        audacious
     )
 
     if generate:

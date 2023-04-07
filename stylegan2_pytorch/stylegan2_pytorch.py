@@ -3,6 +3,7 @@ from version import __version__
 
 # minibatch block
 
+# The very original implementation
 class MinibatchBlock(nn.Module):
     def __init__(self, in_features, num_kernels, dim_per_kernel=5, minibatch_size=2) -> None:
         super().__init__()
@@ -41,7 +42,27 @@ class MinibatchBlock(nn.Module):
         f = f.reshape(x.shape[0], -1)
         
         return torch.cat([x, f], dim=1)
-            
+  
+# the PyTorch equivalent implementation in the official repo of progressive growing of GANs
+class MiniBatchStdDev(nn.Module):
+    """
+    https://github.com/tkarras/progressive_growing_of_gans/blob/master/networks.py
+    """
+    def __init__(self, group_size=4):
+        super().__init__()
+        self.group_size = group_size
+        
+    def forward(self, x):
+        group_size = min(self.group_size, x.shape[0])
+        s = x.shape
+        y = x.reshape(group_size, -1, s[1], s[2], s[3])
+        y = y - y.mean(dim=0, keepdim=True)    
+        y = torch.sqrt(y.pow(2).mean(dim=0) + 1e-8)
+        y = y.mean(dim=[1,2,3], keepdim=True)
+        y = y.type(x.dtype)                         # cast back to original data type
+        y = y.repeat(group_size, s[1], s[2], s[3])
+        return torch.cat([x, y], dim=1)
+    
 # communication blocks
 
 class CommConv(nn.Module):
@@ -84,7 +105,8 @@ class CommConv3D(nn.Module):
             raise NotImplementedError
 
         # register this module as a buffer
-        self.register_buffer('weight', self.conv.weight.data)
+        if comm_type != 'maxpool':
+            self.register_buffer('weight', self.conv.weight.data)
 
     def forward(self, x):
         # circular padding
@@ -112,11 +134,10 @@ class CommConv4D(nn.Module):
         else:
             raise NotImplementedError
 
-
         # register this module as a buffer
-        self.register_buffer('weight', self.conv.weight.data)
+        if comm_type != 'maxpool':
+            self.register_buffer('weight', self.conv.weight.data)
 
-        
     def forward(self, x):
         b,c,h,w = x.shape
         x = x.view(b,c*h,w)
@@ -266,11 +287,14 @@ class GeneratorBlock(nn.Module):
         return x, rgb
 
 class DiscriminatorBlock(nn.Module):
-    def __init__(self, input_channels, filters, downsample=True, num_comm_channels=0, comm_type='mean'):
+    def __init__(self, input_channels, filters, downsample=True, num_comm_channels=0, comm_type='mean', stddev_minibatch_size = 4):
         super().__init__()
         # TODO
         assert filters > num_comm_channels, "Number of communication channels must be less than number of filters"
         self.conv_res = nn.Conv2d(input_channels, filters, 1, stride = (2 if downsample else 1))
+
+        if stddev_minibatch_size > 1:
+            input_channels *= 2
 
         if num_comm_channels > 0:
             # here inplace=False is important, otherwise the gradient will not be propagated
@@ -289,7 +313,13 @@ class DiscriminatorBlock(nn.Module):
                 nn.Conv2d(filters, filters, 3, padding=1),
                 leaky_relu(),
             )
-
+            
+        if stddev_minibatch_size > 1:
+            self.net = nn.Sequential(
+                MiniBatchStdDev(stddev_minibatch_size),
+                *self.net.children()
+            )
+            
         self.downsample = nn.Sequential(
             Blur(),
             nn.Conv2d(filters, filters, 3, padding = 1, stride = 2)
@@ -371,10 +401,12 @@ class Generator(nn.Module):
 
 class Discriminator(nn.Module):
     def __init__(self, image_size, network_capacity = 16, fq_layers = [], fq_dict_size = 256, attn_layers = [], transparent = False, fmap_max = 512,
-                  comm_type='mean', comm_capacity=0, num_packs=1, minibatch_size=1):
+                  comm_type='mean', comm_capacity=0, num_packs=1, minibatch_size=1, minibatch_type='original'):
         super().__init__()
+        assert minibatch_type in ['original', 'stddev'], "minibatch_type must be either 'original' or 'stddev'"
         print("comm_capacity", comm_capacity)
         print("num_packs", num_packs)
+        print("minibatch_size", minibatch_size)
         self.num_packs = num_packs 
         num_layers = int(log2(image_size) - 1)
         num_init_filters = 3 if not transparent else 4
@@ -394,9 +426,14 @@ class Discriminator(nn.Module):
         for ind, (in_chan, out_chan, comm_chan) in enumerate(chan_in_out_comm):
             num_layer = ind + 1
             is_not_last = ind != (len(chan_in_out_comm) - 1)
-
+            
+            if not is_not_last and minibatch_type == 'stddev' and minibatch_size > 1:
+                stddev_minibatch_size = minibatch_size
+            else:
+                stddev_minibatch_size = 0
+                
             block = DiscriminatorBlock(in_chan, out_chan, downsample = is_not_last, 
-                                       num_comm_channels=comm_chan, comm_type=comm_type)
+                                       num_comm_channels=comm_chan, comm_type=comm_type, stddev_minibatch_size=stddev_minibatch_size)
             blocks.append(block)
 
             attn_fn = attn_and_ff(out_chan) if num_layer in attn_layers else None
@@ -425,11 +462,14 @@ class Discriminator(nn.Module):
         self.final_conv = nn.Conv2d(chan_last, chan_last, 3, padding=1)
         self.flatten = Flatten()
         # minibatch block
-        if minibatch_size == 1:
+        if minibatch_size == 1 or minibatch_type == 'stddev':
             self.minibatchLayer = nn.Identity()
-        else:
+        elif minibatch_type == 'original':
             self.minibatchLayer = MinibatchBlock(latent_dim, num_kernels=100, minibatch_size=minibatch_size)
             latent_dim = self.minibatchLayer.get_out_features()
+        else:
+            raise NotImplementedError
+            
         self.to_logit = nn.Linear(latent_dim, 1)
 
     def forward(self, x):
@@ -469,7 +509,7 @@ class StyleGAN2(nn.Module):
         image_size, latent_dim = 512, 
         fmap_max = 512, style_depth = 8, 
         network_capacity = 16, transparent = False, fp16 = False, 
-        comm_type='mean', comm_capacity=0, num_packs=1, minibatch_size=1,
+        comm_type='mean', comm_capacity=0, num_packs=1, minibatch_size=1, minibatch_type = 'original',
         cl_reg = False, 
         steps = 1, 
         lr = 1e-4, ttur_mult = 2, betas = (0.5, 0.9), # for optimizers
@@ -492,7 +532,7 @@ class StyleGAN2(nn.Module):
         self.S = StyleVectorizer(latent_dim, style_depth, lr_mul = lr_mlp)
         self.G = Generator(image_size, latent_dim, network_capacity, transparent = transparent, attn_layers = attn_layers, no_const = no_const, fmap_max = fmap_max)
         self.D = Discriminator(image_size, network_capacity, fq_layers = fq_layers, fq_dict_size = fq_dict_size, attn_layers = attn_layers, transparent = transparent, fmap_max = fmap_max, 
-                            comm_type=comm_type, comm_capacity=comm_capacity, num_packs=num_packs, minibatch_size=minibatch_size)
+                            comm_type=comm_type, comm_capacity=comm_capacity, num_packs=num_packs, minibatch_size=minibatch_size, minibatch_type=minibatch_type)
 
         self.SE = StyleVectorizer(latent_dim, style_depth, lr_mul = lr_mlp)
         self.GE = Generator(image_size, latent_dim, network_capacity, transparent = transparent, attn_layers = attn_layers, no_const = no_const)
@@ -577,10 +617,11 @@ class Trainer():
         network_capacity = 16,
         fmap_max = 512,
         transparent = False,
-        comm_type = 'mean',     # type of communication.            For discriminator only.
-        comm_capacity=0,        # number of communication channels. For discriminator only.
-        num_packs=1,            # number of packs.                  For discriminator only.
-        minibatch_size = 4,      # minibase size.                    For discriminator only.
+        comm_type = 'mean',         # type of communication.            For discriminator only.
+        comm_capacity=0,            # number of communication channels. For discriminator only.
+        num_packs=1,                # number of packs.                  For discriminator only.
+        minibatch_size = 4,         # minibase size.                    For discriminator only.
+        minibatch_type = 'original', # 'original' or 'stddev'.          For discriminator only.
         batch_size = 4,
         mixed_prob = 0.9,
         n_critic = 1,
@@ -614,15 +655,20 @@ class Trainer():
         rank = 0,
         # world_size = 1,
         log = False,
+        audacious=False,            # this is for some audacious attempts
         *args,
         **kwargs
     ):
+        assert 32 % n_critic == 0, 'This sounds unreasonable. But this is to make sure gradient penalty is applied every 32 iterations.'
         assert batch_size % num_packs == 0, 'batch size on each gpu must be divisible by num_packs'
         assert batch_size % minibatch_size == 0, 'batch size on each gpu must be divisible by minibatch_size'
+        assert minibatch_type in ['original', 'stddev'], "minibatch type must be 'original' or 'stddev'"
         assert loss_type in ['hinge', 'bce', 'dual_contrast', 'wasserstein'], 'loss_type must be one of [hinge, bce, dual_contrast, wasserstein]'
         assert aug_prob >= 0 and aug_prob <= 1, 'aug_prob must be between 0 and 1'
         assert dataset_aug_prob >= 0 and dataset_aug_prob <= 1, 'dataset_aug_prob must be between 0 and 1'
         assert isinstance(rank, int) and rank >= 0, 'rank must be a non-negative integer'
+        
+        self.audacious = audacious
 
         self.GAN_params = [args, kwargs]
         self.GAN = None
@@ -646,6 +692,7 @@ class Trainer():
         self.comm_capacity = comm_capacity
         self.num_packs = num_packs
         self.minibatch_size = minibatch_size
+        self.minibatch_type = minibatch_type
 
         self.fq_layers = cast_list(fq_layers)
         self.fq_dict_size = fq_dict_size
@@ -728,7 +775,7 @@ class Trainer():
     @property
     def hparams(self):
         return {'image_size': self.image_size, 'network_capacity': self.network_capacity, 
-                'comm_type':self.comm_type, 'comm_capacity':self.comm_capacity, 'num_packs':self.num_packs, 'minibatch_size':self.minibatch_size}
+                'comm_type':self.comm_type, 'comm_capacity':self.comm_capacity, 'num_packs':self.num_packs, 'minibatch_size':self.minibatch_size, 'minibatch_type':self.minibatch_type}
         
     def init_GAN(self):
         args, kwargs = self.GAN_params
@@ -739,7 +786,7 @@ class Trainer():
             lr = self.lr, lr_mlp = self.lr_mlp, ttur_mult = self.ttur_mult, betas=betas,
             image_size = self.image_size, network_capacity = self.network_capacity, 
             fmap_max = self.fmap_max, transparent = self.transparent, 
-            comm_type=self.comm_type, comm_capacity=self.comm_capacity, num_packs= self.num_packs, minibatch_size=self.minibatch_size,
+            comm_type=self.comm_type, comm_capacity=self.comm_capacity, num_packs= self.num_packs, minibatch_size=self.minibatch_size, minibatch_type=self.minibatch_type,
             fq_layers = self.fq_layers, fq_dict_size = self.fq_dict_size, attn_layers = self.attn_layers, 
             fp16 = self.fp16, cl_reg = self.cl_reg, no_const = self.no_const, rank = self.rank, 
             *args, **kwargs)
@@ -773,6 +820,7 @@ class Trainer():
         self.comm_capacity = config.pop('comm_capacity', self.comm_capacity)
         self.num_packs = config.pop('num_packs', self.num_packs)
         self.minibatch_size = config.pop('minibatch_size', self.minibatch_size)
+        self.minibatch_type = config.pop('minibatch_type', self.minibatch_type)
         del self.GAN
         self.init_GAN()
 
@@ -780,7 +828,7 @@ class Trainer():
         return {'image_size': self.image_size, 'network_capacity': self.network_capacity, 
                 'lr_mlp': self.lr_mlp, 'transparent': self.transparent,
                 'fq_layers': self.fq_layers, 'fq_dict_size': self.fq_dict_size, 'attn_layers': self.attn_layers, 'no_const': self.no_const,
-                'comm_type':self.comm_type, 'comm_capacity':self.comm_capacity, 'num_packs': self.num_packs, 'minibatch_size': self.minibatch_size
+                'comm_type':self.comm_type, 'comm_capacity':self.comm_capacity, 'num_packs': self.num_packs, 'minibatch_size': self.minibatch_size, 'minibatch_type': self.minibatch_type
                 }
 
     def set_data_src(self, folder):
@@ -1244,7 +1292,11 @@ class Trainer():
         self.write_config()
 
     def load(self, num = -1):
-        self.load_config()
+        if not self.audacious:
+            self.load_config()
+            strict = True
+        else:
+            strict = False
 
         name = num
         if num == -1:
@@ -1263,12 +1315,12 @@ class Trainer():
             print(f"loading from version {load_data['version']}")
 
         try:
-            self.GAN.load_state_dict(load_data['GAN'])
+            self.GAN.load_state_dict(load_data['GAN'], strict=strict)
         except Exception as e:
             print('unable to load save model. please try downgrading the package to the version specified by the saved model')
             raise e
         if self.GAN.fp16 and 'amp' in load_data:
-            amp.load_state_dict(load_data['amp'])
+            amp.load_state_dict(load_data['amp'], strict=strict)
 
 class ModelLoader:
     def __init__(self, *, base_dir, name = 'default', load_from = -1):
@@ -1298,13 +1350,13 @@ class ModelLoader:
 if __name__ == '__main__':
     # test unit for minibatch block
     
-    mb = MinibatchBlock(in_features=20, num_kernels=5, dim_per_kernel=3, minibatch_size=8)
-    x = torch.randn(32, 20)
+    # mb = MinibatchBlock(in_features=20, num_kernels=5, dim_per_kernel=3, minibatch_size=8)
+    # x = torch.randn(32, 20)
+    # out = mb(x)
+    # print(mb.get_out_features())
+    
+    mb = MiniBatchStdDev()
+    x  = torch.randn(32, 124, 4, 4)
     out = mb(x)
-    print(mb.get_out_features())
     print(out.shape)
     
-    # fcl = nn.FullyConnectedLayer(in_features=mb.get_out_features(), out_features=10)
-    fcl = nn.Linear(mb.get_out_features(), 10)
-    
-    print(fcl(out).shape)
