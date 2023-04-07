@@ -117,7 +117,7 @@ def train_from_folder(
     clear_fid_cache = False,
     seed = 42,
     log = False,
-    audatious = False
+    audacious = False
 ):
     if name == 'default':
         name = f"b{batch_size}_{loss_type}"
@@ -131,9 +131,15 @@ def train_from_folder(
             name += 'stddev' if minibatch_type == 'stddev' else ''
         if ttur_mult != 1.5:
             name += f"_t{ttur_mult}"
+            
+    data_name = str(os.path.basename(data))        
+    from cleanfid import fid
+    if calculate_fid_every is not None and not fid.test_stats_exists(data_name, mode='clean'):
+        fid.make_custom_stats(name=data_name, fdir = data, mode='clean')
         
     model_args = dict(
         name = name,
+        data_name = data_name,          # for computing FID
         results_dir = results_dir,
         models_dir = models_dir,
         batch_size = batch_size,
@@ -171,7 +177,7 @@ def train_from_folder(
         clear_fid_cache = clear_fid_cache,
         mixed_prob = mixed_prob,
         log = log,
-        audacious
+        audacious=audacious
     )
 
     if generate:

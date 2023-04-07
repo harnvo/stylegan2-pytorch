@@ -32,6 +32,7 @@ from torchvision import transforms
 # from stylegan2_pytorch.diff_augment import DiffAugment
 # from version import __version__
 from diff_augment import DiffAugment
+from cleanfid import fid
 
 from vector_quantize_pytorch import VectorQuantize
 

@@ -610,6 +610,7 @@ class Trainer():
     def __init__(
         self,
         name = 'default',
+        data_name = 'img_align_celeba',
         results_dir = 'results',
         models_dir = 'models',
         base_dir = './',
@@ -674,6 +675,7 @@ class Trainer():
         self.GAN = None
 
         self.name = name
+        self.data_name = data_name
 
         base_dir = Path(base_dir)
         self.base_dir = base_dir
@@ -1130,23 +1132,24 @@ class Trainer():
 
     @torch.no_grad()
     def calculate_fid(self, num_batches):
-        from pytorch_fid import fid_score
+        # from pytorch_fid import fid_score
+        from cleanfid import fid
         torch.cuda.empty_cache()
 
-        real_path = self.fid_dir / 'real'
+        # real_path = self.fid_dir / 'real'
         fake_path = self.fid_dir / 'fake'
 
         # remove any existing files used for fid calculation and recreate directories
 
-        if not real_path.exists() or self.clear_fid_cache:
-            rmtree(real_path, ignore_errors=True)
-            os.makedirs(real_path)
+        # if not real_path.exists() or self.clear_fid_cache:
+        #     rmtree(real_path, ignore_errors=True)
+        #     os.makedirs(real_path)
 
-            for batch_num in tqdm(range(num_batches), desc='calculating FID - saving reals'):
-                real_batch = next(self.loader)
-                for k, image in enumerate(real_batch.unbind(0)):
-                    filename = str(k + batch_num * self.batch_size)
-                    torchvision.utils.save_image(image, str(real_path / f'{filename}.png'))
+        #     for batch_num in tqdm(range(num_batches), desc='calculating FID - saving reals'):
+        #         real_batch = next(self.loader)
+        #         for k, image in enumerate(real_batch.unbind(0)):
+        #             filename = str(k + batch_num * self.batch_size)
+        #             torchvision.utils.save_image(image, str(real_path / f'{filename}.png'))
 
         # generate a bunch of fake images in results / name / fid_fake
 
@@ -1171,11 +1174,12 @@ class Trainer():
             for j, image in enumerate(generated_images.unbind(0)):
                 torchvision.utils.save_image(image, str(fake_path / f'{str(j + batch_num * self.batch_size)}-ema.{ext}'))
 
-        return fid_score.calculate_fid_given_paths([str(real_path), str(fake_path)], 256, noise.device, 2048)
+        # return fid_score.calculate_fid_given_paths([str(real_path), str(fake_path)], 256, noise.device, 2048)
+        return fid.compute_fid(str(fake_path), dataset_name = self.data_name, mode = 'clean', dataset_split="custom")
 
     @torch.no_grad()
-    def truncate_style(self, tensor, trunc_psi = 0.75):
-        S = self.GAN.S
+    def truncate_style(self, tensor, S, trunc_psi = 0.75):
+        # S = self.GAN.S
         batch_size = self.batch_size
         latent_dim = self.GAN.G.latent_dim
 
@@ -1190,17 +1194,18 @@ class Trainer():
         return tensor
 
     @torch.no_grad()
-    def truncate_style_defs(self, w, trunc_psi = 0.75):
+    def truncate_style_defs(self, w, S, trunc_psi = 0.75):
         w_space = []
         for tensor, num_layers in w:
-            tensor = self.truncate_style(tensor, trunc_psi = trunc_psi)            
+            tensor = self.truncate_style(tensor, S = S, trunc_psi = trunc_psi)            
             w_space.append((tensor, num_layers))
         return w_space
 
     @torch.no_grad()
     def generate_truncated(self, S, G, style, noi, trunc_psi = 0.75, num_image_tiles = 8):
+        
         w = map(lambda t: (S(t[0]), t[1]), style)
-        w_truncated = self.truncate_style_defs(w, trunc_psi = trunc_psi)
+        w_truncated = self.truncate_style_defs(w, S = S, trunc_psi = trunc_psi)
         w_styles = styles_def_to_tensor(w_truncated)
         generated_images = evaluate_in_chunks(self.batch_size, G, w_styles, noi)
         return generated_images.clamp_(0., 1.)

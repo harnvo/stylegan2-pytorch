@@ -339,10 +339,7 @@ class Analyzer():
             noise = image_noise(self.batch_size, image_size, device=self.rank)
 
             # moving averages
-            w_space = latent_to_w(self.GAN.SE, latents)
-            w_styles = styles_def_to_tensor(w_space)
-
-            generated_images = self.GAN.GE(w_styles, noise)
+            generated_images = self.generate_truncated(self.GAN.SE, self.GAN.GE, latents, noise, trunc_psi = self.trunc_psi)
 
             for j, image in enumerate(generated_images.unbind(0)):
                 torchvision.utils.save_image(image, str(fake_path1 / f'{str(j + batch_num * self.batch_size)}.{ext}'))
@@ -350,8 +347,8 @@ class Analyzer():
         return fid_score.calculate_fid_given_paths([str(fake_path), str(fake_path1)], self.batch_size, self.rank, 2048)
         
     @torch.no_grad()
-    def truncate_style(self, tensor, trunc_psi = 0.75):
-        S = self.GAN.S
+    def truncate_style(self, tensor, S, trunc_psi = 0.75):
+        # S = self.GAN.S
         batch_size = self.batch_size
         latent_dim = self.GAN.G.latent_dim
 
@@ -366,17 +363,17 @@ class Analyzer():
         return tensor
 
     @torch.no_grad()
-    def truncate_style_defs(self, w, trunc_psi = 0.75):
+    def truncate_style_defs(self, w, S, trunc_psi = 0.75):
         w_space = []
         for tensor, num_layers in w:
-            tensor = self.truncate_style(tensor, trunc_psi = trunc_psi)            
+            tensor = self.truncate_style(tensor, S, trunc_psi = trunc_psi)            
             w_space.append((tensor, num_layers))
         return w_space
 
     @torch.no_grad()
     def generate_truncated(self, S, G, style, noi, trunc_psi = 0.75, num_image_tiles = 8):
         w = map(lambda t: (S(t[0]), t[1]), style)
-        w_truncated = self.truncate_style_defs(w, trunc_psi = trunc_psi)
+        w_truncated = self.truncate_style_defs(w, S, trunc_psi = trunc_psi)
         w_styles = styles_def_to_tensor(w_truncated)
         generated_images = evaluate_in_chunks(self.batch_size, G, w_styles, noi)
         return generated_images.clamp_(0., 1.)
@@ -487,7 +484,7 @@ if __name__ == '__main__':
         )
         # to test if the model can be loaded correctly
         analyzer.load() 
-        print(analyzer.num_parameters())
+        # print(analyzer.num_parameters())
         
     analyzer.save_fid_stat_for_data(batch_size=512)
     
@@ -510,7 +507,7 @@ if __name__ == '__main__':
             clear_fid_cache=True
         )
         
-        fid, fid_std, intra_fid, intra_fid_std = analyzer.analyse_fid(num_repetitions=2)
+        fid, fid_std, intra_fid, intra_fid_std = analyzer.analyse_fid(num_repetitions=20)
         
         with open('./results.csv', 'a') as f:
             f.write(f'{name}, {fid}, {fid_std}, {intra_fid}, {intra_fid_std} \n')
