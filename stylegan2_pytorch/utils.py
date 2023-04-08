@@ -232,16 +232,16 @@ def raise_if_nan(t):
     if torch.isnan(t):
         raise NanException
 
-def gradient_accumulate_contexts(gradient_accumulate_every):
-    # if is_ddp:
-    #     num_no_syncs = gradient_accumulate_every - 1
-    #     head = [combine_contexts(map(lambda ddp: ddp.no_sync, ddps))] * num_no_syncs
-    #     tail = [null_context]
-    #     contexts =  head + tail
-    # else:
-    #     contexts = [null_context] * gradient_accumulate_every
+def gradient_accumulate_contexts(gradient_accumulate_every, is_ddp, ddps):
+    if is_ddp:
+        num_no_syncs = gradient_accumulate_every - 1
+        head = [combine_contexts(map(lambda ddp: ddp.no_sync, ddps))] * num_no_syncs
+        tail = [null_context]
+        contexts =  head + tail
+    else:
+        contexts = [null_context] * gradient_accumulate_every
 
-    contexts = [null_context] * gradient_accumulate_every
+    # contexts = [null_context] * gradient_accumulate_every
 
     for context in contexts:
         with context():

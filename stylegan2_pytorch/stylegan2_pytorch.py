@@ -518,12 +518,12 @@ class StyleGAN2(nn.Module):
         attn_layers = [], 
         no_const = False, 
         lr_mlp = 0.1, 
-        rank = 0
+        device = 0
         ):
         super().__init__()
         assert not cl_reg, "contrastive learning disabled for this project"
         # assert optimizer in ['adam', 'sgd', 'RMSprop'], "optimizer must be one of adam, sgd, RMSprop"
-        assert isinstance(rank, int) and rank >= 0, "rank must be a non-negative integer"
+        assert isinstance(device, int) and device >= 0, "device must be a non-negative integer"
 
         self.lr = lr
         self.steps = steps
@@ -572,7 +572,7 @@ class StyleGAN2(nn.Module):
         self._init_weights()
         self.reset_parameter_averaging()
 
-        self.cuda(rank)
+        self.cuda(device)
 
         # startup apex mixed precision
         self.fp16 = fp16
@@ -627,7 +627,8 @@ class Trainer():
         mixed_prob = 0.9,
         n_critic = 1,
         gradient_accumulate_every=1,
-        lr = 2e-4, lr_mlp = 0.1, ttur_mult = 2, # for optimizers
+        lr = 2e-4, lr_mlp = 0.1, ttur_mult = 2,     # for optimizers
+        G_reg_interval = 4, D_reg_interval = 16,    # for regularization
         rel_disc_loss = False,
         num_workers = None,
         save_every = 1000,
@@ -652,9 +653,7 @@ class Trainer():
         calculate_fid_every = None,
         calculate_fid_num_images = 12800,
         clear_fid_cache = False,
-        # is_ddp = False,
-        rank = 0,
-        # world_size = 1,
+        is_ddp = False, device = 0, is_main = True, world_size = 1, # distributed training
         log = False,
         audacious=False,            # this is for some audacious attempts
         *args,
@@ -667,7 +666,7 @@ class Trainer():
         assert loss_type in ['hinge', 'bce', 'dual_contrast', 'wasserstein'], 'loss_type must be one of [hinge, bce, dual_contrast, wasserstein]'
         assert aug_prob >= 0 and aug_prob <= 1, 'aug_prob must be between 0 and 1'
         assert dataset_aug_prob >= 0 and dataset_aug_prob <= 1, 'dataset_aug_prob must be between 0 and 1'
-        assert isinstance(rank, int) and rank >= 0, 'rank must be a non-negative integer'
+        assert isinstance(device, int) and device >= 0, 'device must be a non-negative integer'
         
         self.audacious = audacious
 
@@ -705,6 +704,7 @@ class Trainer():
 
         self.aug_prob = aug_prob
         self.aug_types = aug_types
+        self.aug_kwargs = {'prob': self.aug_prob, 'types': self.aug_types}
 
         # self.optimizer = optimizer
         self.lr = lr
@@ -714,6 +714,9 @@ class Trainer():
         self.batch_size = batch_size
         self.num_workers = num_workers
         self.mixed_prob = mixed_prob
+        
+        self.G_reg_interval = G_reg_interval
+        self.D_reg_interval = D_reg_interval
 
         self.num_image_tiles = num_image_tiles
         self.evaluate_every = evaluate_every
@@ -757,14 +760,35 @@ class Trainer():
 
         # self.dual_contrast_loss = dual_contrast_loss
         self.loss_type = loss_type
+        
+        # setup losses
+        if self.loss_type == 'hinge':
+            self.D_loss_fn = hinge_loss
+            self.G_loss_fn = gen_hinge_loss
+            self.G_requires_reals = False
+        elif self.loss_type == 'dual_contrast':
+            self.D_loss_fn = dual_contrastive_loss
+            self.G_loss_fn = dual_contrastive_loss
+            self.G_requires_reals = True
+        elif self.loss_type == 'bce':
+            self.D_loss_fn = bce_loss
+            self.G_loss_fn = gen_bce_loss
+            # raise NotImplementedError
+            self.G_requires_reals = False
+        elif self.loss_type == 'wasserstein':
+            self.D_loss_fn = w_loss
+            self.G_loss_fn = gen_w_loss
+            self.G_requires_reals = False
+            
+        self.backwards = partial(loss_backwards, self.fp16)
 
-        # assert not (is_ddp and cl_reg), 'Contrastive loss regularization does not work well with multi GPUs yet'
-        # self.is_ddp = is_ddp
-        # self.is_main = rank == 0
-        self.rank = rank
-        # self.world_size = world_size
+        assert not (is_ddp and cl_reg), 'Contrastive loss regularization does not work well with multi GPUs yet'
+        self.is_ddp = is_ddp
+        self.is_main = is_main
+        self.device = device
+        self.world_size = world_size
 
-        self.logger = aim.Session(experiment=name) if log else None
+        self.logger = aim.Session(experiment=name) if (log and is_main) else None
 
     @property
     def image_extension(self):
@@ -790,15 +814,27 @@ class Trainer():
             fmap_max = self.fmap_max, transparent = self.transparent, 
             comm_type=self.comm_type, comm_capacity=self.comm_capacity, num_packs= self.num_packs, minibatch_size=self.minibatch_size, minibatch_type=self.minibatch_type,
             fq_layers = self.fq_layers, fq_dict_size = self.fq_dict_size, attn_layers = self.attn_layers, 
-            fp16 = self.fp16, cl_reg = self.cl_reg, no_const = self.no_const, rank = self.rank, 
+            fp16 = self.fp16, cl_reg = self.cl_reg, no_const = self.no_const, device = self.device, 
             *args, **kwargs)
 
         # if self.is_ddp:
-        #     ddp_kwargs = {'device_ids': [self.rank]}
+        #     ddp_kwargs = {'device_ids': [self.device]}
         #     self.S_ddp = DDP(self.GAN.S, **ddp_kwargs)
         #     self.G_ddp = DDP(self.GAN.G, **ddp_kwargs)
         #     self.D_ddp = DDP(self.GAN.D, **ddp_kwargs)
         #     self.D_aug_ddp = DDP(self.GAN.D_aug, **ddp_kwargs)
+        if self.is_ddp:
+            ddp_kwargs = {'device_ids': [self.device]}
+            self.S = DDP(self.GAN.S, **ddp_kwargs)
+            self.G = DDP(self.GAN.G, **ddp_kwargs)
+            self.D = DDP(self.GAN.D, **ddp_kwargs)
+            self.D_aug = DDP(self.GAN.D_aug, **ddp_kwargs)
+        else:
+            self.S = self.GAN.S
+            self.G = self.GAN.G
+            self.D = self.GAN.D
+            self.D_aug = self.GAN.D_aug
+
 
         if exists(self.logger):
             self.logger.set_params(self.hparams)
@@ -835,10 +871,11 @@ class Trainer():
 
     def set_data_src(self, folder):
         self.dataset = Dataset(folder, self.image_size, transparent = self.transparent, aug_prob = self.dataset_aug_prob)
-        # num_workers = num_workers = default(self.num_workers, NUM_CORES if not self.is_ddp else 0)
-        num_workers = num_workers = default(self.num_workers, NUM_CORES)
-        # sampler = DistributedSampler(self.dataset, rank=self.rank, num_replicas=self.world_size, shuffle=True) if self.is_ddp else None
-        # dataloader = data.DataLoader(self.dataset, num_workers = num_workers, batch_size = math.ceil(self.batch_size / self.world_size), sampler = sampler, shuffle = not self.is_ddp, drop_last = True, pin_memory = True)
+        num_workers = num_workers = default(self.num_workers, NUM_CORES if not self.is_ddp else 0)
+        # num_workers = num_workers = default(self.num_workers, NUM_CORES)
+        # sampler = DistributedSampler(self.dataset, rank=self.device, num_replicas=self.world_size, shuffle=True) if self.is_ddp else None
+        sampler = DistributedSampler(self.dataset, shuffle=True) if self.is_ddp else None # we don't need to specify rank and world_size, it will be done automatically because we have set it in dist
+        dataloader = data.DataLoader(self.dataset, num_workers = num_workers, batch_size = math.ceil(self.batch_size / self.world_size), sampler = sampler, shuffle = not self.is_ddp, drop_last = True, pin_memory = True)
         dataloader = data.DataLoader(self.dataset, num_workers = num_workers, batch_size = self.batch_size, shuffle = True, drop_last = True, pin_memory = True)
         self.loader = cycle(dataloader)
 
@@ -855,8 +892,8 @@ class Trainer():
             self.init_GAN()
 
         self.GAN.train()
-        total_disc_loss = torch.tensor(0.).cuda(self.rank)
-        total_gen_loss = torch.tensor(0.).cuda(self.rank)
+        # total_disc_loss = torch.tensor(0.).cuda(self.device)
+        # total_gen_loss = torch.tensor(0.).cuda(self.device)
 
         # batch_size = math.ceil(self.batch_size / self.world_size)
         batch_size = self.batch_size
@@ -865,12 +902,13 @@ class Trainer():
         latent_dim = self.GAN.G.latent_dim
         num_layers = self.GAN.G.num_layers
 
-        aug_prob   = self.aug_prob
-        aug_types  = self.aug_types
-        aug_kwargs = {'prob': aug_prob, 'types': aug_types}
+        # aug_prob   = self.aug_prob
+        # aug_types  = self.aug_types
+        # aug_kwargs = {'prob': aug_prob, 'types': aug_types}
 
-        apply_gradient_penalty = (self.steps % 4 == 0) if self.loss_type != 'wasserstein' else True
-        apply_path_penalty = not self.no_pl_reg and self.steps > 5000 and self.steps % 32 == 0
+        apply_gradient_penalty  = (self.steps % self.D_reg_interval == 0) if self.loss_type != 'wasserstein' else True
+        apply_path_penalty      = not self.no_pl_reg and self.steps > 5000 and self.steps % self.G_reg_interval == 0
+        # apply_r1_reg            = self.steps > 5000 and self.steps % self.D_reg_interval == 0
         apply_cl_reg_to_generated = self.steps > 20000
 
         # S = self.GAN.S if not self.is_ddp else self.S_ddp
@@ -878,12 +916,12 @@ class Trainer():
         # D = self.GAN.D if not self.is_ddp else self.D_ddp
         # D_aug = self.GAN.D_aug if not self.is_ddp else self.D_aug_ddp
 
-        S = self.GAN.S
-        G = self.GAN.G
-        D = self.GAN.D
-        D_aug = self.GAN.D_aug
+        # S = self.GAN.S
+        # G = self.GAN.G
+        # D = self.GAN.D
+        # D_aug = self.GAN.D_aug
 
-        backwards = partial(loss_backwards, self.fp16)
+        # backwards = partial(loss_backwards, self.fp16)
 
         if exists(self.GAN.D_cl):
             self.GAN.D_opt.zero_grad()
@@ -891,8 +929,8 @@ class Trainer():
             if apply_cl_reg_to_generated:
                 for i in range(self.gradient_accumulate_every):
                     get_latents_fn = mixed_list if random() < self.mixed_prob else noise_list
-                    style = get_latents_fn(batch_size, num_layers, latent_dim, device=self.rank)
-                    noise = image_noise(batch_size, image_size, device=self.rank)
+                    style = get_latents_fn(batch_size, num_layers, latent_dim, device=self.device)
+                    noise = image_noise(batch_size, image_size, device=self.device)
 
                     w_space = latent_to_w(self.GAN.S, style)
                     w_styles = styles_def_to_tensor(w_space)
@@ -901,33 +939,33 @@ class Trainer():
                     self.GAN.D_cl(generated_images.clone().detach(), accumulate=True)
 
             for i in range(self.gradient_accumulate_every):
-                image_batch = next(self.loader).cuda(self.rank)
+                image_batch = next(self.loader).cuda(self.device)
                 self.GAN.D_cl(image_batch, accumulate=True)
 
             loss = self.GAN.D_cl.calculate_loss()
             self.last_cr_loss = loss.clone().detach().item()
-            backwards(loss, self.GAN.D_opt, loss_id = 0)
+            self.backwards(loss, self.GAN.D_opt, loss_id = 0)
 
             self.GAN.D_opt.step()
 
-        # setup losses
-        if self.loss_type == 'hinge':
-            D_loss_fn = hinge_loss
-            G_loss_fn = gen_hinge_loss
-            G_requires_reals = False
-        elif self.loss_type == 'dual_contrast':
-            D_loss_fn = dual_contrastive_loss
-            G_loss_fn = dual_contrastive_loss
-            G_requires_reals = True
-        elif self.loss_type == 'bce':
-            D_loss_fn = bce_loss
-            G_loss_fn = gen_bce_loss
-            # raise NotImplementedError
-            G_requires_reals = False
-        elif self.loss_type == 'wasserstein':
-            D_loss_fn = w_loss
-            G_loss_fn = gen_w_loss
-            G_requires_reals = False
+        # # setup losses
+        # if self.loss_type == 'hinge':
+        #     D_loss_fn = hinge_loss
+        #     G_loss_fn = gen_hinge_loss
+        #     G_requires_reals = False
+        # elif self.loss_type == 'dual_contrast':
+        #     D_loss_fn = dual_contrastive_loss
+        #     G_loss_fn = dual_contrastive_loss
+        #     G_requires_reals = True
+        # elif self.loss_type == 'bce':
+        #     D_loss_fn = bce_loss
+        #     G_loss_fn = gen_bce_loss
+        #     # raise NotImplementedError
+        #     G_requires_reals = False
+        # elif self.loss_type == 'wasserstein':
+        #     D_loss_fn = w_loss
+        #     G_loss_fn = gen_w_loss
+        #     G_requires_reals = False
 
         # if not self.dual_contrast_loss:
         #     D_loss_fn = hinge_loss
@@ -938,113 +976,123 @@ class Trainer():
         #     G_loss_fn = dual_contrastive_loss
         #     G_requires_reals = True
 
+        # avg_pl_length = self.pl_mean
+        
         # train discriminator
-        with no_grad(S,G):
-            avg_pl_length = self.pl_mean
-            self.GAN.D_opt.zero_grad()
+        with no_grad(self.S, self.G):
+            total_disc_loss = self._train_discriminator(apply_gradient_penalty)
+        # with no_grad(self.S, self.G):
+        #     self.GAN.D_opt.zero_grad()
 
-            for i in gradient_accumulate_contexts(self.gradient_accumulate_every):
-                get_latents_fn = mixed_list if random() < self.mixed_prob else noise_list
-                style = get_latents_fn(batch_size, num_layers, latent_dim, device=self.rank)
-                noise = image_noise(batch_size, image_size, device=self.rank)
+        #     for i in gradient_accumulate_contexts(self.gradient_accumulate_every, self.is_ddp, ddps=[self.D_aug, self.S, self.G]):
+        #         get_latents_fn = mixed_list if random() < self.mixed_prob else noise_list
+        #         style = get_latents_fn(batch_size, num_layers, latent_dim, device=self.device)
+        #         noise = image_noise(batch_size, image_size, device=self.device)
 
                 
-                w_space = latent_to_w(S, style)
-                w_styles = styles_def_to_tensor(w_space)
+        #         w_space = latent_to_w(self.S, style)
+        #         w_styles = styles_def_to_tensor(w_space)
 
-                generated_images = G(w_styles, noise)
-                fake_output, fake_q_loss = D_aug(generated_images.clone().detach(), detach = True, **aug_kwargs)
+        #         generated_images = self.G(w_styles, noise)
+        #         fake_output, fake_q_loss = self.D_aug(generated_images.clone().detach(), detach = True, **aug_kwargs)
 
-                image_batch = next(self.loader).cuda(self.rank)
-                image_batch.requires_grad_()
-                real_output, real_q_loss = D_aug(image_batch, **aug_kwargs)
+        #         image_batch = next(self.loader).cuda(self.device)
+        #         image_batch.requires_grad_()
+        #         real_output, real_q_loss = self.D_aug(image_batch, **aug_kwargs)
 
-                real_output_loss = real_output
-                fake_output_loss = fake_output
+        #         real_output_loss = real_output
+        #         fake_output_loss = fake_output
 
-                if self.rel_disc_loss:
-                    real_output_loss = real_output_loss - fake_output.mean()
-                    fake_output_loss = fake_output_loss - real_output.mean()
+        #         if self.rel_disc_loss:
+        #             real_output_loss = real_output_loss - fake_output.mean()
+        #             fake_output_loss = fake_output_loss - real_output.mean()
 
-                divergence = D_loss_fn(real_output_loss, fake_output_loss)
-                disc_loss = divergence
+        #         divergence = self.D_loss_fn(real_output_loss, fake_output_loss)
+        #         disc_loss = divergence
 
-                if self.has_fq:
-                    quantize_loss = (fake_q_loss + real_q_loss).mean()
-                    self.q_loss = float(quantize_loss.detach().item())
+        #         if self.has_fq:
+        #             quantize_loss = (fake_q_loss + real_q_loss).mean()
+        #             self.q_loss = float(quantize_loss.detach().item())
 
-                    disc_loss = disc_loss + quantize_loss
+        #             disc_loss = disc_loss + quantize_loss
 
-                if apply_gradient_penalty:
-                    gp = gradient_penalty(image_batch, real_output)
-                    self.last_gp_loss = gp.clone().detach().item()
-                    self.track(self.last_gp_loss, 'GP')
-                    disc_loss = disc_loss + gp
+        #         if apply_gradient_penalty:
+        #             gp = gradient_penalty(image_batch, real_output)
+        #             self.last_gp_loss = gp.clone().detach().item()
+        #             self.track(self.last_gp_loss, 'GP')
+        #             disc_loss = disc_loss + gp
 
-            disc_loss = disc_loss / self.gradient_accumulate_every
-            disc_loss.register_hook(raise_if_nan)
-            backwards(disc_loss, self.GAN.D_opt, loss_id = 1)
+        #     disc_loss = disc_loss / self.gradient_accumulate_every
+        #     disc_loss.register_hook(raise_if_nan)
+        #     backwards(disc_loss, self.GAN.D_opt, loss_id = 1)
 
-            total_disc_loss += divergence.detach().item() / self.gradient_accumulate_every
+        #     total_disc_loss += divergence.detach().item() / self.gradient_accumulate_every
 
-            self.d_loss = float(total_disc_loss)
-            self.track(self.d_loss, 'D')
+        #     self.d_loss = float(total_disc_loss)
+        #     self.track(self.d_loss, 'D')
 
-            self.GAN.D_opt.step()
+        #     self.GAN.D_opt.step()
 
         # train generator
         if self.steps % self.n_critic == 0:
-            with no_grad(D_aug):
-                self.GAN.G_opt.zero_grad()
-                for i in gradient_accumulate_contexts(self.gradient_accumulate_every):
-                    style = get_latents_fn(batch_size, num_layers, latent_dim, device=self.rank)
-                    noise = image_noise(batch_size, image_size, device=self.rank)
+            with no_grad(self.D_aug):
+                total_gen_loss, avg_pl_length = self._train_generator(apply_path_penalty=apply_path_penalty)
+        else:
+            total_gen_loss = 0
+        
+        # if self.steps % self.n_critic == 0:
+        #     with no_grad(self.D_aug):
+        #         self.GAN.G_opt.zero_grad()
+        #         for i in gradient_accumulate_contexts(self.gradient_accumulate_every, self.is_ddp, ddps=[self.S, self.G, self.D_aug]):
+        #             get_latents_fn = mixed_list if random() < self.mixed_prob else noise_list
+        #             style = get_latents_fn(batch_size, num_layers, latent_dim, device=self.device)
+        #             noise = image_noise(batch_size, image_size, device=self.device)
 
                     
-                    w_space = latent_to_w(S, style)
-                    w_styles = styles_def_to_tensor(w_space)
+        #             w_space = latent_to_w(self.S, style)
+        #             w_styles = styles_def_to_tensor(w_space)
 
-                    generated_images = G(w_styles, noise)
-                    fake_output, _ = D_aug(generated_images, **aug_kwargs)
-                    fake_output_loss = fake_output
+        #             generated_images = self.G(w_styles, noise)
+        #             fake_output, _ = self.D_aug(generated_images, **aug_kwargs)
+        #             fake_output_loss = fake_output
 
-                    real_output = None
-                    if G_requires_reals:
-                        image_batch = next(self.loader).cuda(self.rank)
-                        real_output, _ = D_aug(image_batch, detach = True, **aug_kwargs)
-                        real_output = real_output.detach()
+        #             real_output = None
+        #             if self.G_requires_reals:
+        #                 image_batch = next(self.loader).cuda(self.device)
+        #                 real_output, _ = self.D_aug(image_batch, detach = True, **aug_kwargs)
+        #                 real_output = real_output.detach()
 
-                    if self.top_k_training:
-                        epochs = (self.steps * batch_size * self.gradient_accumulate_every) / len(self.dataset)
-                        k_frac = max(self.generator_top_k_gamma ** epochs, self.generator_top_k_frac)
-                        k = math.ceil(batch_size * k_frac)
+        #             if self.top_k_training:
+        #                 epochs = (self.steps * batch_size * self.gradient_accumulate_every) / len(self.dataset)
+        #                 k_frac = max(self.generator_top_k_gamma ** epochs, self.generator_top_k_frac)
+        #                 k = math.ceil(batch_size * k_frac)
 
-                        if k != batch_size:
-                            fake_output_loss, _ = fake_output_loss.topk(k=k, largest=False)
+        #                 if k != batch_size:
+        #                     fake_output_loss, _ = fake_output_loss.topk(k=k, largest=False)
 
-                    loss = G_loss_fn(fake_output_loss, real_output)
-                    gen_loss = loss
+        #             loss = self.G_loss_fn(fake_output_loss, real_output)
+        #             gen_loss = loss
 
-                    if apply_path_penalty:
-                        pl_lengths = calc_pl_lengths(w_styles, generated_images)
-                        avg_pl_length = np.mean(pl_lengths.detach().cpu().numpy())
+        #             if apply_path_penalty:
+        #                 pl_lengths = calc_pl_lengths(w_styles, generated_images)
+        #                 avg_pl_length = np.mean(pl_lengths.detach().cpu().numpy())
 
-                        if not is_empty(self.pl_mean):
-                            pl_loss = ((pl_lengths - self.pl_mean) ** 2).mean()
-                            if not torch.isnan(pl_loss):
-                                gen_loss = gen_loss + pl_loss
+        #                 if not is_empty(self.pl_mean):
+        #                     pl_loss = ((pl_lengths - self.pl_mean) ** 2).mean()
+        #                     if not torch.isnan(pl_loss):
+        #                         gen_loss = gen_loss + pl_loss
 
-                    gen_loss = gen_loss / self.gradient_accumulate_every
-                    gen_loss.register_hook(raise_if_nan)
-                    backwards(gen_loss, self.GAN.G_opt, loss_id = 2)
-                    del gen_loss
+        #             gen_loss = gen_loss / self.gradient_accumulate_every
+        #             gen_loss.register_hook(raise_if_nan)
+        #             backwards(gen_loss, self.GAN.G_opt, loss_id = 2)
+        #             del gen_loss
 
-                    total_gen_loss += loss.detach().item() / self.gradient_accumulate_every
+        #             total_gen_loss += loss.detach().item() / self.gradient_accumulate_every
 
-                self.g_loss = float(total_gen_loss)
-                self.track(self.g_loss, 'G')
+        #         self.g_loss = float(total_gen_loss)
+        #         self.track(self.g_loss, 'G')
 
-                self.GAN.G_opt.step()
+        #         self.GAN.G_opt.step()
 
         # calculate moving averages
 
@@ -1052,10 +1100,10 @@ class Trainer():
             self.pl_mean = self.pl_length_ma.update_average(self.pl_mean, avg_pl_length)
             self.track(self.pl_mean, 'PL')
 
-        if self.steps % 10 == 0 and self.steps > 20000:
+        if self.is_main and self.steps % 10 == 0 and self.steps > 20000:
             self.GAN.EMA()
 
-        if self.steps <= 25000 and self.steps % 1000 == 2:
+        if self.is_main and self.steps <= 25000 and self.steps % 1000 == 2:
             self.GAN.reset_parameter_averaging()
 
         # save from NaN errors
@@ -1067,23 +1115,146 @@ class Trainer():
 
         # periodically save results
 
-        # if self.is_main:
-        if self.steps % self.save_every == 0:
-            self.save(self.checkpoint_num)
+        if self.is_main:
+            if self.steps % self.save_every == 0:
+                self.save(self.checkpoint_num)
 
-        if self.steps % self.evaluate_every == 0 or (self.steps % 100 == 0 and self.steps < 2500):
-            self.evaluate(floor(self.steps / self.evaluate_every))
+            if self.steps % self.evaluate_every == 0 or (self.steps % 100 == 0 and self.steps < 2500):
+                self.evaluate(floor(self.steps / self.evaluate_every))
 
-        if exists(self.calculate_fid_every) and self.steps % self.calculate_fid_every == 0 and self.steps != 0:
-            num_batches = math.ceil(self.calculate_fid_num_images / self.batch_size)
-            fid = self.calculate_fid(num_batches)
-            self.last_fid = fid
+            if exists(self.calculate_fid_every) and self.steps % self.calculate_fid_every == 0 and self.steps != 0:
+                num_batches = math.ceil(self.calculate_fid_num_images / self.batch_size)
+                fid = self.calculate_fid(num_batches)
+                self.last_fid = fid
 
-            with open(str(self.results_dir / self.name / f'fid_scores.txt'), 'a') as f:
-                f.write(f'{self.steps},{fid}\n')
+                with open(str(self.results_dir / self.name / f'fid_scores.txt'), 'a') as f:
+                    f.write(f'{self.steps},{fid}\n')
 
         self.steps += 1
         self.av = None
+    
+    def _train_discriminator(self, apply_gradient_penalty):
+        total_disc_loss = torch.tensor(0.).cuda(self.device)
+        self.GAN.D_opt.zero_grad()
+        
+        batch_size = self.batch_size
+        image_size = self.GAN.G.image_size
+        latent_dim = self.GAN.G.latent_dim
+        num_layers = self.GAN.G.num_layers
+
+        for i in gradient_accumulate_contexts(self.gradient_accumulate_every, self.is_ddp, ddps=[self.D_aug, self.S, self.G]):
+            get_latents_fn = mixed_list if random() < self.mixed_prob else noise_list
+            style = get_latents_fn(batch_size, num_layers, latent_dim, device=self.device)
+            noise = image_noise(batch_size, image_size, device=self.device)
+
+            w_space = latent_to_w(self.S, style)
+            w_styles = styles_def_to_tensor(w_space)
+
+            generated_images = self.G(w_styles, noise)
+            fake_output, fake_q_loss = self.D_aug(generated_images.clone().detach(), detach = True, **self.aug_kwargs)
+
+            image_batch = next(self.loader).cuda(self.device)
+            image_batch.requires_grad_()
+            real_output, real_q_loss = self.D_aug(image_batch, **self.aug_kwargs)
+
+            real_output_loss = real_output
+            fake_output_loss = fake_output
+
+            if self.rel_disc_loss:
+                real_output_loss = real_output_loss - fake_output.mean()
+                fake_output_loss = fake_output_loss - real_output.mean()
+
+            divergence = self.D_loss_fn(real_output_loss, fake_output_loss)
+            disc_loss = divergence
+
+            if self.has_fq:
+                quantize_loss = (fake_q_loss + real_q_loss).mean()
+                self.q_loss = float(quantize_loss.detach().item())
+
+                disc_loss = disc_loss + quantize_loss
+
+            if apply_gradient_penalty:
+                gp = gradient_penalty(image_batch, real_output)
+                self.last_gp_loss = gp.clone().detach().item()
+                self.track(self.last_gp_loss, 'GP')
+                disc_loss = disc_loss + gp
+
+        disc_loss = disc_loss / self.gradient_accumulate_every
+        disc_loss.register_hook(raise_if_nan)
+        self.backwards(disc_loss, self.GAN.D_opt, loss_id = 1)
+
+        total_disc_loss += divergence.detach().item() / self.gradient_accumulate_every
+
+        self.d_loss = float(total_disc_loss)
+        self.track(self.d_loss, 'D')
+
+        self.GAN.D_opt.step()
+        
+        return total_disc_loss
+       
+    def _train_generator(self, apply_path_penalty):
+        total_gen_loss = torch.tensor(0.).cuda(self.device)
+        
+        batch_size = self.batch_size
+        image_size = self.GAN.G.image_size
+        latent_dim = self.GAN.G.latent_dim
+        num_layers = self.GAN.G.num_layers
+        
+        self.GAN.G_opt.zero_grad()
+        for i in gradient_accumulate_contexts(self.gradient_accumulate_every, self.is_ddp, ddps=[self.S, self.G, self.D_aug]):
+            get_latents_fn = mixed_list if random() < self.mixed_prob else noise_list
+            style = get_latents_fn(batch_size, num_layers, latent_dim, device=self.device)
+            noise = image_noise(batch_size, image_size, device=self.device)
+
+            
+            w_space = latent_to_w(self.S, style)
+            w_styles = styles_def_to_tensor(w_space)
+
+            generated_images = self.G(w_styles, noise)
+            fake_output, _ = self.D_aug(generated_images, **self.aug_kwargs)
+            fake_output_loss = fake_output
+
+            real_output = None
+            if self.G_requires_reals:
+                image_batch = next(self.loader).cuda(self.device)
+                real_output, _ = self.D_aug(image_batch, detach = True, **self.aug_kwargs)
+                real_output = real_output.detach()
+
+            if self.top_k_training:
+                epochs = (self.steps * batch_size * self.gradient_accumulate_every) / len(self.dataset)
+                k_frac = max(self.generator_top_k_gamma ** epochs, self.generator_top_k_frac)
+                k = math.ceil(batch_size * k_frac)
+
+                if k != batch_size:
+                    fake_output_loss, _ = fake_output_loss.topk(k=k, largest=False)
+
+            loss = self.G_loss_fn(fake_output_loss, real_output)
+            gen_loss = loss
+
+            if apply_path_penalty:
+                pl_lengths = calc_pl_lengths(w_styles, generated_images)
+                avg_pl_length = np.mean(pl_lengths.detach().cpu().numpy())
+
+                if not is_empty(self.pl_mean):
+                    pl_loss = ((pl_lengths - self.pl_mean) ** 2).mean()
+                    if not torch.isnan(pl_loss):
+                        gen_loss = gen_loss + pl_loss
+            else:
+                avg_pl_length = self.pl_mean
+                
+            gen_loss = gen_loss / self.gradient_accumulate_every
+            gen_loss.register_hook(raise_if_nan)
+            self.backwards(gen_loss, self.GAN.G_opt, loss_id = 2)
+            del gen_loss
+
+            total_gen_loss += loss.detach().item() / self.gradient_accumulate_every
+
+        self.g_loss = float(total_gen_loss)
+        self.track(self.g_loss, 'G')
+
+        self.GAN.G_opt.step()
+        
+        return total_gen_loss, avg_pl_length
 
     @torch.no_grad()
     def evaluate(self, num = 0, trunc = 1.0):
@@ -1097,8 +1268,8 @@ class Trainer():
 
         # latents and noise
 
-        latents = noise_list(num_rows ** 2, num_layers, latent_dim, device=self.rank)
-        n = image_noise(num_rows ** 2, image_size, device=self.rank)
+        latents = noise_list(num_rows ** 2, num_layers, latent_dim, device=self.device)
+        n = image_noise(num_rows ** 2, image_size, device=self.device)
 
         # regular
 
@@ -1117,10 +1288,10 @@ class Trainer():
             repeat_idx = [1] * a.dim()
             repeat_idx[dim] = n_tile
             a = a.repeat(*(repeat_idx))
-            order_index = torch.LongTensor(np.concatenate([init_dim * np.arange(n_tile) + i for i in range(init_dim)])).cuda(self.rank)
+            order_index = torch.LongTensor(np.concatenate([init_dim * np.arange(n_tile) + i for i in range(init_dim)])).cuda(self.device)
             return torch.index_select(a, dim, order_index)
 
-        nn = noise(num_rows, latent_dim, device=self.rank)
+        nn = noise(num_rows, latent_dim, device=self.device)
         tmp1 = tile(nn, 0, num_rows)
         tmp2 = nn.repeat(num_rows, 1)
 
@@ -1132,6 +1303,7 @@ class Trainer():
 
     @torch.no_grad()
     def calculate_fid(self, num_batches):
+        assert self.is_main
         # from pytorch_fid import fid_score
         from cleanfid import fid
         torch.cuda.empty_cache()
@@ -1162,11 +1334,14 @@ class Trainer():
         latent_dim = self.GAN.G.latent_dim
         image_size = self.GAN.G.image_size
         num_layers = self.GAN.G.num_layers
+        
+        print('calculating FID...')
 
-        for batch_num in tqdm(range(num_batches), desc='calculating FID - saving generated'):
+        # for batch_num in tqdm(range(num_batches), desc='calculating FID - saving generated'):
+        for batch_num in range(num_batches):
             # latents and noise
-            latents = noise_list(self.batch_size, num_layers, latent_dim, device=self.rank)
-            noise = image_noise(self.batch_size, image_size, device=self.rank)
+            latents = noise_list(self.batch_size, num_layers, latent_dim, device=self.device)
+            noise = image_noise(self.batch_size, image_size, device=self.device)
 
             # moving averages
             generated_images = self.generate_truncated(self.GAN.SE, self.GAN.GE, latents, noise, trunc_psi = self.trunc_psi)
@@ -1175,7 +1350,8 @@ class Trainer():
                 torchvision.utils.save_image(image, str(fake_path / f'{str(j + batch_num * self.batch_size)}-ema.{ext}'))
 
         # return fid_score.calculate_fid_given_paths([str(real_path), str(fake_path)], 256, noise.device, 2048)
-        return fid.compute_fid(str(fake_path), dataset_name = self.data_name, mode = 'clean', dataset_split="custom")
+        return fid.compute_fid(str(fake_path), dataset_name = self.data_name, mode = 'clean' , dataset_split="custom", \
+                               use_dataparallel = not self.is_ddp, verbose = False, device = self.device, num_workers = 0)
 
     @torch.no_grad()
     def truncate_style(self, tensor, S, trunc_psi = 0.75):
@@ -1184,12 +1360,12 @@ class Trainer():
         latent_dim = self.GAN.G.latent_dim
 
         if not exists(self.av):
-            z = noise(2000, latent_dim, device=self.rank)
+            z = noise(2000, latent_dim, device=self.device)
             samples = evaluate_in_chunks(batch_size, S, z).cpu().numpy()
             self.av = np.mean(samples, axis = 0)
             self.av = np.expand_dims(self.av, axis = 0)
 
-        av_torch = torch.from_numpy(self.av).cuda(self.rank)
+        av_torch = torch.from_numpy(self.av).cuda(self.device)
         tensor = trunc_psi * (tensor - av_torch) + av_torch
         return tensor
 
@@ -1222,9 +1398,9 @@ class Trainer():
 
         # latents and noise
 
-        latents_low = noise(num_rows ** 2, latent_dim, device=self.rank)
-        latents_high = noise(num_rows ** 2, latent_dim, device=self.rank)
-        n = image_noise(num_rows ** 2, image_size, device=self.rank)
+        latents_low = noise(num_rows ** 2, latent_dim, device=self.device)
+        latents_high = noise(num_rows ** 2, latent_dim, device=self.device)
+        n = image_noise(num_rows ** 2, image_size, device=self.device)
 
         ratios = torch.linspace(0., 8., num_steps)
 

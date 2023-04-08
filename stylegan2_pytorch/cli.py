@@ -23,27 +23,32 @@ def timestamped_filename(prefix = 'generated-'):
 
 def set_seed(seed):
     torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
     torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+    # torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.benchmark = True
     np.random.seed(seed)
     random.seed(seed)
 
-def run_training(rank, model_args, data, load_from, new, num_train_steps, name, seed):
-    # is_main = rank == 0
-    # is_ddp = world_size > 1
+def run_training(rank, devices, model_args, data, load_from, new, num_train_steps, name, seed):
+    is_main = rank == 0
+    world_size = len(devices)
+    is_ddp = world_size > 1
+    # print('rank', rank, 'is_main', is_main)
 
-    # if is_ddp:
-    #     set_seed(seed)
-    #     os.environ['MASTER_ADDR'] = 'localhost'
-    #     os.environ['MASTER_PORT'] = '12355'
-    #     dist.init_process_group('nccl', rank=rank, world_size=world_size)
+    if is_ddp:
+        set_seed(seed)
+        os.environ['MASTER_ADDR'] = 'localhost'
+        os.environ['MASTER_PORT'] = '12355'
+        dist.init_process_group('nccl', rank=rank, world_size=world_size)
 
-    #     print(f"{rank + 1}/{world_size} process initialized.")
+        print(f"{rank + 1}/{world_size} process initialized.")
 
     model_args.update(
-        # is_ddp = is_ddp,
-        rank = rank,
-        # world_size = world_size
+        is_ddp = is_ddp,
+        device = devices[rank],
+        is_main = is_main,
+        world_size = world_size
     )
 
     model = Trainer(**model_args)
@@ -60,13 +65,13 @@ def run_training(rank, model_args, data, load_from, new, num_train_steps, name, 
         retry_call(model.train, tries=3, exceptions=NanException)
         progress_bar.n = model.steps
         progress_bar.refresh()
-        if model.steps % 50 == 0:
+        if model.steps % 50 == 0 and is_main:
             model.print_log()
     print("saving...")
     model.save(model.checkpoint_num)
 
-    # if is_ddp:
-    #     dist.destroy_process_group()
+    if is_ddp:
+        dist.destroy_process_group()
 
 def train_from_folder(
     data = './data',
@@ -84,8 +89,8 @@ def train_from_folder(
     n_critic = 1,
     gradient_accumulate_every = 6,
     num_train_steps = 50000,
-    learning_rate = 2e-4, lr_mlp = 0.1,
-    ttur_mult = 1.5,
+    learning_rate = 2e-4, lr_mlp = 0.1, ttur_mult = 1.5,
+    G_reg_interval = 4, D_reg_interval = 16,    # for regularization
     rel_disc_loss = False,
     num_workers =  None,
     save_every = 1000, evaluate_every = 1000,
@@ -111,7 +116,7 @@ def train_from_folder(
     generator_top_k_frac = 0.5,
     loss_type = 'hinge',
     dataset_aug_prob = 0.,
-    device = 0,
+    devices = [0],
     calculate_fid_every = None,
     calculate_fid_num_images = 12800,
     clear_fid_cache = False,
@@ -132,6 +137,10 @@ def train_from_folder(
         if ttur_mult != 1.5:
             name += f"_t{ttur_mult}"
             
+    if devices == 'all':
+        num_devices = torch.cuda.device_count()
+        devices = list(range(num_devices))
+            
     data_name = str(os.path.basename(data))        
     from cleanfid import fid
     if calculate_fid_every is not None and not fid.test_stats_exists(data_name, mode='clean'):
@@ -150,8 +159,8 @@ def train_from_folder(
         fmap_max = fmap_max,
         transparent = transparent,
         comm_type = comm_type, comm_capacity = comm_capacity, num_packs = num_packs, minibatch_size = minibatch_size, minibatch_type = 'stddev',
-        lr = learning_rate, lr_mlp = lr_mlp,
-        ttur_mult = ttur_mult,
+        lr = learning_rate, lr_mlp = lr_mlp, ttur_mult = ttur_mult,
+        G_reg_interval = G_reg_interval, D_reg_interval = D_reg_interval,
         rel_disc_loss = rel_disc_loss,
         num_workers = num_workers,
         save_every = save_every,
@@ -197,18 +206,19 @@ def train_from_folder(
         print(f'interpolation generated at {results_dir}/{name}/{samples_name}')
         return
     
-    run_training(device, model_args, data, load_from, new, num_train_steps, name, seed)
+    # run_training(device, model_args, data, load_from, new, num_train_steps, name, seed)
 
-    # world_size = torch.cuda.device_count()
+    assert 0 < len(devices) <= torch.cuda.device_count(), f'invalid device list {devices}'
+    world_size = len(devices)
 
-    # if world_size == 1 or not multi_gpus:
-    #     run_training(0, 1, model_args, data, load_from, new, num_train_steps, name, seed)
-    #     return
+    if world_size == 1:
+        run_training(0, devices, model_args, data, load_from, new, num_train_steps, name, seed)
+        return
 
-    # mp.spawn(run_training,
-    #     args=(world_size, model_args, data, load_from, new, num_train_steps, name, seed),
-    #     nprocs=world_size,
-    #     join=True)
+    mp.spawn(run_training,
+        args=(devices, model_args, data, load_from, new, num_train_steps, name, seed),
+        nprocs=world_size,
+        join=True)
 
 def main():
     fire.Fire(train_from_folder)
