@@ -263,6 +263,12 @@ def gradient_penalty(images, output, weight = 10):
     gradients = gradients.reshape(batch_size, -1)
     return weight * ((gradients.norm(2, dim=1) - 1) ** 2).mean()
 
+def r1_reg(images, output, gamma):
+    gradients = torch_grad(outputs=output.sum(), inputs=images, create_graph=True, only_inputs=True)[0]
+    r1_penalty = gradients.square().sum([1,2,3])
+    return (gamma/2) * r1_penalty.mean()
+    
+
 def calc_pl_lengths(styles, images):
     device = images.device
     num_pixels = images.shape[2] * images.shape[3]

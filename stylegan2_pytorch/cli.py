@@ -92,9 +92,9 @@ def train_from_folder(
     n_critic = 1,
     gradient_accumulate_every = 1,
     num_train_steps = 5_000_000,
-    learning_rate = 2e-3, lr_mlp = 0.01, ttur_mult = 1, # lr_mlp: Learning rate multiplier for the mapping layers.
+    learning_rate = 2e-4, lr_mlp = 0.1, ttur_mult = 1.5, # lr_mlp: Learning rate multiplier for the mapping layers.
     G_reg_interval = 4, D_reg_interval = 16,    # for regularization
-    pl_weight = 2, r1_gamma = 0.5,
+    pl_weight = 2, gp_gamma = 2, r1_gamma = 2,
     rel_disc_loss = False,
     num_workers =  None,
     save_every = 5000, evaluate_every = 5000,
@@ -123,7 +123,7 @@ def train_from_folder(
     dataset_aug_prob = 0.,
     devices = [0],
     calculate_fid_every = None,
-    calculate_fid_num_images = 12800,
+    calculate_fid_num_images = 50_000,
     clear_fid_cache = False,
     seed = 0,
     log = False,
@@ -167,7 +167,7 @@ def train_from_folder(
         minibatch_size = minibatch_size, mbstd_num_channels = mbstd_num_channels ,minibatch_type = minibatch_type,
         lr = learning_rate, lr_mlp = lr_mlp, ttur_mult = ttur_mult,
         G_reg_interval = G_reg_interval, D_reg_interval = D_reg_interval,
-        pl_weight = pl_weight, r1_gamma = r1_gamma,
+        pl_weight = pl_weight, gp_gamma = gp_gamma, r1_gamma = r1_gamma,
         rel_disc_loss = rel_disc_loss,
         num_workers = num_workers,
         save_every = save_every,

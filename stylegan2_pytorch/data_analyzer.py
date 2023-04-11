@@ -28,6 +28,7 @@ class Analyzer():
         num_packs=1,            # number of packs.                  For discriminator only.
         minibatch_size=1,       # minibatch size.                   For discriminator only.
         minibatch_type='original', # minibatch type.                For discriminator only.
+        mbstd_num_channels = 0  # for minibatchstd
         batch_size = 4,
         num_workers = None,
         num_image_tiles = 8,
@@ -127,7 +128,8 @@ class Analyzer():
     @property
     def hparams(self):
         return {'image_size': self.image_size, 'network_capacity': self.network_capacity, 
-                'comm_type':self.comm_type, 'comm_capacity':self.comm_capacity, 'num_packs':self.num_packs, 'minibatch_size':self.minibatch_size, 'minibatch_type':self.minibatch_type,}
+                'comm_type':self.comm_type, 'comm_capacity':self.comm_capacity, 'num_packs':self.num_packs, 
+                'minibatch_size':self.minibatch_size, 'minibatch_type':self.minibatch_type, 'mbstd_num_channels': self.mbstd_num_channels}
         
     def init_GAN(self):
         args, kwargs = self.GAN_params
@@ -136,7 +138,8 @@ class Analyzer():
         self.GAN = StyleGAN2(
             lr = 1, lr_mlp = self.lr_mlp, ttur_mult = 1, betas = (0.0, 0.99),
             image_size = self.image_size, network_capacity = self.network_capacity, 
-            fmap_max = self.fmap_max, transparent = self.transparent, comm_capacity=self.comm_capacity, num_packs= self.num_packs, minibatch_size=self.minibatch_size,
+            fmap_max = self.fmap_max, transparent = self.transparent, comm_capacity=self.comm_capacity, num_packs= self.num_packs, 
+            minibatch_size=self.minibatch_size, minibatch_type = self.minibatch_type, mbstd_num_channels = self.mbstd_num_channels,
             fq_layers = self.fq_layers, fq_dict_size = self.fq_dict_size, attn_layers = self.attn_layers, 
             fp16 = self.fp16, cl_reg = self.cl_reg, no_const = self.no_const, rank = self.rank, 
             *args, **kwargs)
@@ -168,6 +171,7 @@ class Analyzer():
         self.num_packs = config.pop('num_packs', self.num_packs)
         self.minibatch_size = config.pop('minibatch_size', self.minibatch_size)
         self.minibatch_type = config.pop('minibatch_type', self.minibatch_type)
+        self.mbstd_num_channels = config.pop('mbstd_num_channels', self.mbstd_num_channels)
         del self.GAN
         self.init_GAN()
 
@@ -175,7 +179,8 @@ class Analyzer():
         return {'image_size': self.image_size, 'network_capacity': self.network_capacity, 
                 'lr_mlp': self.lr_mlp, 'transparent': self.transparent,
                 'fq_layers': self.fq_layers, 'fq_dict_size': self.fq_dict_size, 'attn_layers': self.attn_layers, 'no_const': self.no_const,
-                'comm_type':self.comm_type, 'comm_capacity':self.comm_capacity, 'num_packs': self.num_packs, 'minibatch_size': self.minibatch_size, 'minibatch_type': self.minibatch_type
+                'comm_type':self.comm_type, 'comm_capacity':self.comm_capacity, 'num_packs': self.num_packs, 
+                'minibatch_size': self.minibatch_size, 'minibatch_type': self.minibatch_type, 'mbstd_num_channels': self.mbstd_num_channels
                 }
         
     def save_fid_stat_for_data(self, batch_size=64):
