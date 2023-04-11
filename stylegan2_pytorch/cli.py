@@ -57,16 +57,19 @@ def run_training(rank, devices, model_args, data, load_from, new, num_train_step
         model.load(load_from)
     else:
         model.clear()
-
+        
     model.set_data_src(data)
 
-    progress_bar = tqdm(initial = model.steps, total = num_train_steps, mininterval=10., desc=f'{name}<{data}>')
+    progress_bar = tqdm(initial = model.steps, total = num_train_steps, mininterval=10., desc=f'{name}<{data}>') if is_main else None
     while model.steps < num_train_steps:
         retry_call(model.train, tries=3, exceptions=NanException)
-        progress_bar.n = model.steps
-        progress_bar.refresh()
+        # if model.steps % 10 == 0 and progress_bar is not None:
+        if progress_bar is not None:
+            progress_bar.n = model.steps
+            progress_bar.refresh()
         if model.steps % 50 == 0 and is_main:
-            model.print_log()
+            model.print_log()  
+        
     print("saving...")
     model.save(model.checkpoint_num)
 
@@ -84,16 +87,17 @@ def train_from_folder(
     network_capacity = 16,
     fmap_max = 512,
     transparent = False,
-    comm_type = 'mean', comm_capacity = 0, num_packs = 1, minibatch_size=1, minibatch_type='stddev', # for discriminator only
+    comm_type = 'mean', comm_capacity = 0, num_packs = 1, minibatch_size=1, mbstd_num_channels=0, minibatch_type='stddev', # for discriminator only
     batch_size = 32,
     n_critic = 1,
-    gradient_accumulate_every = 6,
-    num_train_steps = 50000,
-    learning_rate = 2e-4, lr_mlp = 0.1, ttur_mult = 1.5,
+    gradient_accumulate_every = 1,
+    num_train_steps = 5_000_000,
+    learning_rate = 2e-3, lr_mlp = 0.01, ttur_mult = 1, # lr_mlp: Learning rate multiplier for the mapping layers.
     G_reg_interval = 4, D_reg_interval = 16,    # for regularization
+    pl_weight = 2, r1_gamma = 0.5,
     rel_disc_loss = False,
     num_workers =  None,
-    save_every = 1000, evaluate_every = 1000,
+    save_every = 5000, evaluate_every = 5000,
     generate = False,
     num_generate = 1,
     generate_interpolation = False,
@@ -110,7 +114,8 @@ def train_from_folder(
     attn_layers = [],
     no_const = False,
     aug_prob = 0.,
-    aug_types = ['translation', 'cutout'],
+    # aug_types = ['translation', 'cutout'],
+    aug_types = [],
     top_k_training = False,
     generator_top_k_gamma = 0.99,
     generator_top_k_frac = 0.5,
@@ -120,7 +125,7 @@ def train_from_folder(
     calculate_fid_every = None,
     calculate_fid_num_images = 12800,
     clear_fid_cache = False,
-    seed = 42,
+    seed = 0,
     log = False,
     audacious = False
 ):
@@ -158,9 +163,11 @@ def train_from_folder(
         network_capacity = network_capacity,
         fmap_max = fmap_max,
         transparent = transparent,
-        comm_type = comm_type, comm_capacity = comm_capacity, num_packs = num_packs, minibatch_size = minibatch_size, minibatch_type = 'stddev',
+        comm_type = comm_type, comm_capacity = comm_capacity, num_packs = num_packs, 
+        minibatch_size = minibatch_size, mbstd_num_channels = mbstd_num_channels ,minibatch_type = minibatch_type,
         lr = learning_rate, lr_mlp = lr_mlp, ttur_mult = ttur_mult,
         G_reg_interval = G_reg_interval, D_reg_interval = D_reg_interval,
+        pl_weight = pl_weight, r1_gamma = r1_gamma,
         rel_disc_loss = rel_disc_loss,
         num_workers = num_workers,
         save_every = save_every,

@@ -43,25 +43,31 @@ class MinibatchBlock(nn.Module):
         
         return torch.cat([x, f], dim=1)
   
-# the PyTorch equivalent implementation in the official repo of progressive growing of GANs
-class MiniBatchStdDev(nn.Module):
-    """
-    https://github.com/tkarras/progressive_growing_of_gans/blob/master/networks.py
-    """
-    def __init__(self, group_size=4):
+class MinibatchStd(torch.nn.Module):
+    def __init__(self, group_size, num_channels=1):
         super().__init__()
+        assert group_size > 1, 'it is meaningless to have minibatching when minibatch_size is 1'
         self.group_size = group_size
-        
+        self.num_channels = num_channels
+
     def forward(self, x):
-        group_size = min(self.group_size, x.shape[0])
-        s = x.shape
-        y = x.reshape(group_size, -1, s[1], s[2], s[3])
-        y = y - y.mean(dim=0, keepdim=True)    
-        y = torch.sqrt(y.pow(2).mean(dim=0) + 1e-8)
-        y = y.mean(dim=[1,2,3], keepdim=True)
-        y = y.type(x.dtype)                         # cast back to original data type
-        y = y.repeat(group_size, s[1], s[2], s[3])
-        return torch.cat([x, y], dim=1)
+        N, C, H, W = x.shape
+        G = torch.min(torch.as_tensor(self.group_size), torch.as_tensor(N)) if self.group_size is not None else N
+        F = self.num_channels
+        c = C // F
+
+        y = x.reshape(G, -1, F, c, H, W)    # [GnFcHW] Split minibatch N into n groups of size G, and channels C into F groups of size c.
+        y = y - y.mean(dim=0)               # [GnFcHW] Subtract mean over group.
+        y = y.square().mean(dim=0)          # [nFcHW]  Calc variance over group.
+        y = (y + 1e-8).sqrt()               # [nFcHW]  Calc stddev over group.
+        y = y.mean(dim=[2,3,4])             # [nF]     Take average over channels and pixels.
+        y = y.reshape(-1, F, 1, 1)          # [nF11]   Add missing dimensions.
+        y = y.repeat(G, 1, H, W)            # [NFHW]   Replicate over group and pixels.
+        x = torch.cat([x, y], dim=1)        # [NCHW]   Append to input as new channels.
+        return x
+
+    def extra_repr(self):
+        return f'group_size={self.group_size}, num_channels={self.num_channels:d}'
     
 # communication blocks
 
@@ -287,14 +293,11 @@ class GeneratorBlock(nn.Module):
         return x, rgb
 
 class DiscriminatorBlock(nn.Module):
-    def __init__(self, input_channels, filters, downsample=True, num_comm_channels=0, comm_type='mean', stddev_minibatch_size = 4):
+    def __init__(self, input_channels, filters, downsample=True, num_comm_channels=0, comm_type='mean'):
         super().__init__()
         # TODO
         assert filters > num_comm_channels, "Number of communication channels must be less than number of filters"
         self.conv_res = nn.Conv2d(input_channels, filters, 1, stride = (2 if downsample else 1))
-
-        if stddev_minibatch_size > 1:
-            input_channels *= 2
 
         if num_comm_channels > 0:
             # here inplace=False is important, otherwise the gradient will not be propagated
@@ -314,11 +317,11 @@ class DiscriminatorBlock(nn.Module):
                 leaky_relu(),
             )
             
-        if stddev_minibatch_size > 1:
-            self.net = nn.Sequential(
-                MiniBatchStdDev(stddev_minibatch_size),
-                *self.net.children()
-            )
+        # if stddev_minibatch_size > 1:
+        #     self.net = nn.Sequential(
+        #         MiniBatchStdDev(stddev_minibatch_size),
+        #         *self.net.children()
+        #     )
             
         self.downsample = nn.Sequential(
             Blur(),
@@ -401,8 +404,9 @@ class Generator(nn.Module):
 
 class Discriminator(nn.Module):
     def __init__(self, image_size, network_capacity = 16, fq_layers = [], fq_dict_size = 256, attn_layers = [], transparent = False, fmap_max = 512,
-                  comm_type='mean', comm_capacity=0, num_packs=1, minibatch_size=1, minibatch_type='original'):
+                  comm_type='mean', comm_capacity=0, num_packs=1, minibatch_size=1, minibatch_type='original', mbstd_num_channels=0):
         super().__init__()
+        assert not (minibatch_type == 'stddev' and minibatch_size == 1 and mbstd_num_channels>0), 'it is meaningless to do minibatching when minibatch_size == 1 '
         assert minibatch_type in ['original', 'stddev'], "minibatch_type must be either 'original' or 'stddev'"
         print("comm_capacity", comm_capacity)
         print("num_packs", num_packs)
@@ -433,7 +437,7 @@ class Discriminator(nn.Module):
                 stddev_minibatch_size = 0
                 
             block = DiscriminatorBlock(in_chan, out_chan, downsample = is_not_last, 
-                                       num_comm_channels=comm_chan, comm_type=comm_type, stddev_minibatch_size=stddev_minibatch_size)
+                                       num_comm_channels=comm_chan, comm_type=comm_type)
             blocks.append(block)
 
             attn_fn = attn_and_ff(out_chan) if num_layer in attn_layers else None
@@ -458,19 +462,30 @@ class Discriminator(nn.Module):
             
         chan_last = filters[-1]
         latent_dim = 2 * 2 * chan_last
+        
+        if minibatch_type == 'stddev' and mbstd_num_channels >= 1:
+            self.final_conv = nn.Sequential(
+                MinibatchStd(group_size=minibatch_size, num_channels=mbstd_num_channels),
+                nn.Conv2d(chan_last+mbstd_num_channels, chan_last, 3, padding=1)
+            )
+        else:
+            self.final_conv = nn.Conv2d(chan_last, chan_last, 3, padding=1)
 
-        self.final_conv = nn.Conv2d(chan_last, chan_last, 3, padding=1)
         self.flatten = Flatten()
         # minibatch block
         if minibatch_size == 1 or minibatch_type == 'stddev':
-            self.minibatchLayer = nn.Identity()
+            self.to_logit = nn.Linear(latent_dim, 1)
         elif minibatch_type == 'original':
-            self.minibatchLayer = MinibatchBlock(latent_dim, num_kernels=100, minibatch_size=minibatch_size)
-            latent_dim = self.minibatchLayer.get_out_features()
+            minibatchLayer = MinibatchBlock(latent_dim, num_kernels=100, minibatch_size=minibatch_size)
+            latent_dim = minibatchLayer.get_out_features()
+            self.to_logit = nn.Sequential(
+                minibatchLayer,
+                nn.Linear(latent_dim, 1),
+            )
         else:
             raise NotImplementedError
             
-        self.to_logit = nn.Linear(latent_dim, 1)
+        # self.to_logit = nn.Linear(latent_dim, 1)
 
     def forward(self, x):
         b, *_ = x.shape
@@ -499,7 +514,6 @@ class Discriminator(nn.Module):
 
         x = self.final_conv(x)
         x = self.flatten(x)
-        x = self.minibatchLayer(x)
         x = self.to_logit(x)
         return x.squeeze(), quantize_loss
 
@@ -509,7 +523,8 @@ class StyleGAN2(nn.Module):
         image_size, latent_dim = 512, 
         fmap_max = 512, style_depth = 8, 
         network_capacity = 16, transparent = False, fp16 = False, 
-        comm_type='mean', comm_capacity=0, num_packs=1, minibatch_size=1, minibatch_type = 'original',
+        comm_type='mean', comm_capacity=0, num_packs=1, 
+        minibatch_size=1, minibatch_type = 'original', mbstd_num_channels = 0,
         cl_reg = False, 
         steps = 1, 
         lr = 1e-4, ttur_mult = 2, betas = (0.5, 0.9), # for optimizers
@@ -532,7 +547,8 @@ class StyleGAN2(nn.Module):
         self.S = StyleVectorizer(latent_dim, style_depth, lr_mul = lr_mlp)
         self.G = Generator(image_size, latent_dim, network_capacity, transparent = transparent, attn_layers = attn_layers, no_const = no_const, fmap_max = fmap_max)
         self.D = Discriminator(image_size, network_capacity, fq_layers = fq_layers, fq_dict_size = fq_dict_size, attn_layers = attn_layers, transparent = transparent, fmap_max = fmap_max, 
-                            comm_type=comm_type, comm_capacity=comm_capacity, num_packs=num_packs, minibatch_size=minibatch_size, minibatch_type=minibatch_type)
+                            comm_type=comm_type, comm_capacity=comm_capacity, num_packs=num_packs, 
+                            minibatch_size=minibatch_size, minibatch_type=minibatch_type, mbstd_num_channels=mbstd_num_channels)
 
         self.SE = StyleVectorizer(latent_dim, style_depth, lr_mul = lr_mlp)
         self.GE = Generator(image_size, latent_dim, network_capacity, transparent = transparent, attn_layers = attn_layers, no_const = no_const)
@@ -623,12 +639,14 @@ class Trainer():
         num_packs=1,                # number of packs.                  For discriminator only.
         minibatch_size = 4,         # minibase size.                    For discriminator only.
         minibatch_type = 'original', # 'original' or 'stddev'.          For discriminator only.
+        mbstd_num_channels = 0,     # for minibatchstd only.
         batch_size = 4,
         mixed_prob = 0.9,
         n_critic = 1,
         gradient_accumulate_every=1,
         lr = 2e-4, lr_mlp = 0.1, ttur_mult = 2,     # for optimizers
         G_reg_interval = 4, D_reg_interval = 16,    # for regularization
+        pl_weight = 2, gp_gamma = 10, r1_gamma = 2,
         rel_disc_loss = False,
         num_workers = None,
         save_every = 1000,
@@ -694,6 +712,7 @@ class Trainer():
         self.num_packs = num_packs
         self.minibatch_size = minibatch_size
         self.minibatch_type = minibatch_type
+        self.mbstd_num_channels = mbstd_num_channels
 
         self.fq_layers = cast_list(fq_layers)
         self.fq_dict_size = fq_dict_size
@@ -717,6 +736,10 @@ class Trainer():
         
         self.G_reg_interval = G_reg_interval
         self.D_reg_interval = D_reg_interval
+        
+        self.pl_weight = pl_weight
+        self.gp_gamma  = gp_gamma
+        self.r1_gamma  = r1_gamma
 
         self.num_image_tiles = num_image_tiles
         self.evaluate_every = evaluate_every
@@ -801,7 +824,8 @@ class Trainer():
     @property
     def hparams(self):
         return {'image_size': self.image_size, 'network_capacity': self.network_capacity, 
-                'comm_type':self.comm_type, 'comm_capacity':self.comm_capacity, 'num_packs':self.num_packs, 'minibatch_size':self.minibatch_size, 'minibatch_type':self.minibatch_type}
+                'comm_type':self.comm_type, 'comm_capacity':self.comm_capacity, 'num_packs':self.num_packs, 
+                'minibatch_size':self.minibatch_size, 'minibatch_type':self.minibatch_type, 'mbstd_num_channels':self.mbstd_num_channels}
         
     def init_GAN(self):
         args, kwargs = self.GAN_params
@@ -812,7 +836,8 @@ class Trainer():
             lr = self.lr, lr_mlp = self.lr_mlp, ttur_mult = self.ttur_mult, betas=betas,
             image_size = self.image_size, network_capacity = self.network_capacity, 
             fmap_max = self.fmap_max, transparent = self.transparent, 
-            comm_type=self.comm_type, comm_capacity=self.comm_capacity, num_packs= self.num_packs, minibatch_size=self.minibatch_size, minibatch_type=self.minibatch_type,
+            comm_type=self.comm_type, comm_capacity=self.comm_capacity, num_packs= self.num_packs, 
+            minibatch_size=self.minibatch_size, minibatch_type=self.minibatch_type, mbstd_num_channels=self.mbstd_num_channels,
             fq_layers = self.fq_layers, fq_dict_size = self.fq_dict_size, attn_layers = self.attn_layers, 
             fp16 = self.fp16, cl_reg = self.cl_reg, no_const = self.no_const, device = self.device, 
             *args, **kwargs)
@@ -859,6 +884,7 @@ class Trainer():
         self.num_packs = config.pop('num_packs', self.num_packs)
         self.minibatch_size = config.pop('minibatch_size', self.minibatch_size)
         self.minibatch_type = config.pop('minibatch_type', self.minibatch_type)
+        self.mbstd_num_channels = config.pop('mbstd_num_channels', self.mbstd_num_channels)
         del self.GAN
         self.init_GAN()
 
@@ -866,7 +892,8 @@ class Trainer():
         return {'image_size': self.image_size, 'network_capacity': self.network_capacity, 
                 'lr_mlp': self.lr_mlp, 'transparent': self.transparent,
                 'fq_layers': self.fq_layers, 'fq_dict_size': self.fq_dict_size, 'attn_layers': self.attn_layers, 'no_const': self.no_const,
-                'comm_type':self.comm_type, 'comm_capacity':self.comm_capacity, 'num_packs': self.num_packs, 'minibatch_size': self.minibatch_size, 'minibatch_type': self.minibatch_type
+                'comm_type':self.comm_type, 'comm_capacity':self.comm_capacity, 'num_packs': self.num_packs, 
+                'minibatch_size': self.minibatch_size, 'minibatch_type': self.minibatch_type, 'mbstd_num_channels':self.mbstd_num_channels
                 }
 
     def set_data_src(self, folder):
@@ -876,7 +903,7 @@ class Trainer():
         # sampler = DistributedSampler(self.dataset, rank=self.device, num_replicas=self.world_size, shuffle=True) if self.is_ddp else None
         sampler = DistributedSampler(self.dataset, shuffle=True) if self.is_ddp else None # we don't need to specify rank and world_size, it will be done automatically because we have set it in dist
         dataloader = data.DataLoader(self.dataset, num_workers = num_workers, batch_size = math.ceil(self.batch_size / self.world_size), sampler = sampler, shuffle = not self.is_ddp, drop_last = True, pin_memory = True)
-        dataloader = data.DataLoader(self.dataset, num_workers = num_workers, batch_size = self.batch_size, shuffle = True, drop_last = True, pin_memory = True)
+        # dataloader = data.DataLoader(self.dataset, num_workers = num_workers, batch_size = self.batch_size, shuffle = True, drop_last = True, pin_memory = True)
         self.loader = cycle(dataloader)
 
         # auto set augmentation prob for user if dataset is detected to be low
@@ -895,8 +922,8 @@ class Trainer():
         # total_disc_loss = torch.tensor(0.).cuda(self.device)
         # total_gen_loss = torch.tensor(0.).cuda(self.device)
 
-        # batch_size = math.ceil(self.batch_size / self.world_size)
-        batch_size = self.batch_size
+        batch_size = math.ceil(self.batch_size / self.world_size)
+        # batch_size = self.batch_size
 
         image_size = self.GAN.G.image_size
         latent_dim = self.GAN.G.latent_dim
@@ -906,9 +933,10 @@ class Trainer():
         # aug_types  = self.aug_types
         # aug_kwargs = {'prob': aug_prob, 'types': aug_types}
 
-        apply_gradient_penalty  = (self.steps % self.D_reg_interval == 0) if self.loss_type != 'wasserstein' else True
+        # apply_gradient_penalty  = (self.steps % self.D_reg_interval == 0) if self.loss_type != 'wasserstein' else True
+        apply_gradient_penalty  = self.loss_type == 'wasserstein'
         apply_path_penalty      = not self.no_pl_reg and self.steps > 5000 and self.steps % self.G_reg_interval == 0
-        # apply_r1_reg            = self.steps > 5000 and self.steps % self.D_reg_interval == 0
+        apply_r1_reg            = self.steps % self.D_reg_interval == 0 if self.loss_type != 'wasserstein' else False
         apply_cl_reg_to_generated = self.steps > 20000
 
         # S = self.GAN.S if not self.is_ddp else self.S_ddp
@@ -980,7 +1008,7 @@ class Trainer():
         
         # train discriminator
         with no_grad(self.S, self.G):
-            total_disc_loss = self._train_discriminator(apply_gradient_penalty)
+            total_disc_loss = self._train_discriminator(batch_size, apply_gradient_penalty, apply_r1_reg)
         # with no_grad(self.S, self.G):
         #     self.GAN.D_opt.zero_grad()
 
@@ -1036,7 +1064,7 @@ class Trainer():
         # train generator
         if self.steps % self.n_critic == 0:
             with no_grad(self.D_aug):
-                total_gen_loss, avg_pl_length = self._train_generator(apply_path_penalty=apply_path_penalty)
+                total_gen_loss, avg_pl_length = self._train_generator(batch_size, apply_path_penalty=apply_path_penalty)
         else:
             total_gen_loss = 0
         
@@ -1133,11 +1161,10 @@ class Trainer():
         self.steps += 1
         self.av = None
     
-    def _train_discriminator(self, apply_gradient_penalty):
+    def _train_discriminator(self, batch_size, apply_gradient_penalty, apply_r1_reg):
         total_disc_loss = torch.tensor(0.).cuda(self.device)
         self.GAN.D_opt.zero_grad()
         
-        batch_size = self.batch_size
         image_size = self.GAN.G.image_size
         latent_dim = self.GAN.G.latent_dim
         num_layers = self.GAN.G.num_layers
@@ -1174,10 +1201,16 @@ class Trainer():
                 disc_loss = disc_loss + quantize_loss
 
             if apply_gradient_penalty:
-                gp = gradient_penalty(image_batch, real_output)
+                gp = gradient_penalty(image_batch, real_output, weight=self.gp_gamma)
                 self.last_gp_loss = gp.clone().detach().item()
                 self.track(self.last_gp_loss, 'GP')
                 disc_loss = disc_loss + gp
+                
+            if apply_r1_reg:
+                r1_loss = r1_reg(image_batch, real_output, gamma=self.r1_gamma)
+                self.last_r1_loss = r1_loss.clone().detach().item()
+                self.track(self.last_r1_loss, 'R1reg')
+                disc_loss = disc_loss + r1_loss
 
         disc_loss = disc_loss / self.gradient_accumulate_every
         disc_loss.register_hook(raise_if_nan)
@@ -1192,10 +1225,9 @@ class Trainer():
         
         return total_disc_loss
        
-    def _train_generator(self, apply_path_penalty):
+    def _train_generator(self, batch_size, apply_path_penalty):
         total_gen_loss = torch.tensor(0.).cuda(self.device)
         
-        batch_size = self.batch_size
         image_size = self.GAN.G.image_size
         latent_dim = self.GAN.G.latent_dim
         num_layers = self.GAN.G.num_layers
@@ -1236,7 +1268,7 @@ class Trainer():
                 avg_pl_length = np.mean(pl_lengths.detach().cpu().numpy())
 
                 if not is_empty(self.pl_mean):
-                    pl_loss = ((pl_lengths - self.pl_mean) ** 2).mean()
+                    pl_loss = ((pl_lengths - self.pl_mean) ** 2).mean() * self.pl_weight
                     if not torch.isnan(pl_loss):
                         gen_loss = gen_loss + pl_loss
             else:
@@ -1431,6 +1463,7 @@ class Trainer():
             ('G', self.g_loss),
             ('D', self.d_loss),
             ('GP', self.last_gp_loss),
+            ('R1reg', self.last_r1_loss),
             ('PL', self.pl_mean),
             ('CR', self.last_cr_loss),
             ('Q', self.q_loss),
