@@ -11,6 +11,7 @@ from shutil import rmtree
 from functools import partial
 import multiprocessing
 from contextlib import contextmanager, ExitStack
+import cleanfid
 
 import numpy as np
 
@@ -268,7 +269,6 @@ def r1_reg(images, output, gamma):
     r1_penalty = gradients.square().sum([1,2,3])
     return (gamma/2) * r1_penalty.mean()
     
-
 def calc_pl_lengths(styles, images):
     device = images.device
     num_pixels = images.shape[2] * images.shape[3]

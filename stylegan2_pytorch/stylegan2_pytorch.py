@@ -43,7 +43,7 @@ class MinibatchBlock(nn.Module):
         
         return torch.cat([x, f], dim=1)
   
-class MinibatchStd(torch.nn.Module):
+class MinibatchStd(nn.Module):
     def __init__(self, group_size, num_channels=1):
         super().__init__()
         assert group_size > 1, 'it is meaningless to have minibatching when minibatch_size is 1'
@@ -170,14 +170,15 @@ class CommBlock(nn.Module):
 class EqualLinear(nn.Module):
     def __init__(self, in_dim, out_dim, lr_mul = 1, bias = True):
         super().__init__()
-        self.weight = nn.Parameter(torch.randn(out_dim, in_dim))
+        self.weight = nn.Parameter( torch.randn(out_dim, in_dim) )
         if bias:
             self.bias = nn.Parameter(torch.zeros(out_dim))
 
         self.lr_mul = lr_mul
 
     def forward(self, input):
-        return F.linear(input, self.weight * self.lr_mul, bias=self.bias * self.lr_mul)
+        bias = self.bias*self.lr_mul if hasattr(self, 'bias') else None
+        return F.linear(input, self.weight * self.lr_mul, bias=bias)
 
 class StyleVectorizer(nn.Module):
     def __init__(self, emb, depth, lr_mul = 0.1):
@@ -598,7 +599,7 @@ class StyleGAN2(nn.Module):
     def _init_weights(self):
         for m in self.modules():
             if type(m) in {nn.Conv2d, nn.Linear}:
-                nn.init.kaiming_normal_(m.weight, a=0, mode='fan_in', nonlinearity='leaky_relu')
+                nn.init.kaiming_normal_(m.weight, a=0.2, mode='fan_in', nonlinearity='leaky_relu')
 
         for block in self.G.blocks:
             nn.init.zeros_(block.to_noise1.weight)
@@ -976,90 +977,11 @@ class Trainer():
 
             self.GAN.D_opt.step()
 
-        # # setup losses
-        # if self.loss_type == 'hinge':
-        #     D_loss_fn = hinge_loss
-        #     G_loss_fn = gen_hinge_loss
-        #     G_requires_reals = False
-        # elif self.loss_type == 'dual_contrast':
-        #     D_loss_fn = dual_contrastive_loss
-        #     G_loss_fn = dual_contrastive_loss
-        #     G_requires_reals = True
-        # elif self.loss_type == 'bce':
-        #     D_loss_fn = bce_loss
-        #     G_loss_fn = gen_bce_loss
-        #     # raise NotImplementedError
-        #     G_requires_reals = False
-        # elif self.loss_type == 'wasserstein':
-        #     D_loss_fn = w_loss
-        #     G_loss_fn = gen_w_loss
-        #     G_requires_reals = False
-
-        # if not self.dual_contrast_loss:
-        #     D_loss_fn = hinge_loss
-        #     G_loss_fn = gen_hinge_loss
-        #     G_requires_reals = False
-        # else:
-        #     D_loss_fn = dual_contrastive_loss
-        #     G_loss_fn = dual_contrastive_loss
-        #     G_requires_reals = True
-
         # avg_pl_length = self.pl_mean
         
         # train discriminator
         with no_grad(self.S, self.G):
             total_disc_loss = self._train_discriminator(batch_size, apply_gradient_penalty, apply_r1_reg)
-        # with no_grad(self.S, self.G):
-        #     self.GAN.D_opt.zero_grad()
-
-        #     for i in gradient_accumulate_contexts(self.gradient_accumulate_every, self.is_ddp, ddps=[self.D_aug, self.S, self.G]):
-        #         get_latents_fn = mixed_list if random() < self.mixed_prob else noise_list
-        #         style = get_latents_fn(batch_size, num_layers, latent_dim, device=self.device)
-        #         noise = image_noise(batch_size, image_size, device=self.device)
-
-                
-        #         w_space = latent_to_w(self.S, style)
-        #         w_styles = styles_def_to_tensor(w_space)
-
-        #         generated_images = self.G(w_styles, noise)
-        #         fake_output, fake_q_loss = self.D_aug(generated_images.clone().detach(), detach = True, **aug_kwargs)
-
-        #         image_batch = next(self.loader).cuda(self.device)
-        #         image_batch.requires_grad_()
-        #         real_output, real_q_loss = self.D_aug(image_batch, **aug_kwargs)
-
-        #         real_output_loss = real_output
-        #         fake_output_loss = fake_output
-
-        #         if self.rel_disc_loss:
-        #             real_output_loss = real_output_loss - fake_output.mean()
-        #             fake_output_loss = fake_output_loss - real_output.mean()
-
-        #         divergence = self.D_loss_fn(real_output_loss, fake_output_loss)
-        #         disc_loss = divergence
-
-        #         if self.has_fq:
-        #             quantize_loss = (fake_q_loss + real_q_loss).mean()
-        #             self.q_loss = float(quantize_loss.detach().item())
-
-        #             disc_loss = disc_loss + quantize_loss
-
-        #         if apply_gradient_penalty:
-        #             gp = gradient_penalty(image_batch, real_output)
-        #             self.last_gp_loss = gp.clone().detach().item()
-        #             self.track(self.last_gp_loss, 'GP')
-        #             disc_loss = disc_loss + gp
-
-        #     disc_loss = disc_loss / self.gradient_accumulate_every
-        #     disc_loss.register_hook(raise_if_nan)
-        #     backwards(disc_loss, self.GAN.D_opt, loss_id = 1)
-
-        #     total_disc_loss += divergence.detach().item() / self.gradient_accumulate_every
-
-        #     self.d_loss = float(total_disc_loss)
-        #     self.track(self.d_loss, 'D')
-
-        #     self.GAN.D_opt.step()
 
         # train generator
         if self.steps % self.n_critic == 0:
@@ -1067,60 +989,6 @@ class Trainer():
                 total_gen_loss, avg_pl_length = self._train_generator(batch_size, apply_path_penalty=apply_path_penalty)
         else:
             total_gen_loss = 0
-        
-        # if self.steps % self.n_critic == 0:
-        #     with no_grad(self.D_aug):
-        #         self.GAN.G_opt.zero_grad()
-        #         for i in gradient_accumulate_contexts(self.gradient_accumulate_every, self.is_ddp, ddps=[self.S, self.G, self.D_aug]):
-        #             get_latents_fn = mixed_list if random() < self.mixed_prob else noise_list
-        #             style = get_latents_fn(batch_size, num_layers, latent_dim, device=self.device)
-        #             noise = image_noise(batch_size, image_size, device=self.device)
-
-                    
-        #             w_space = latent_to_w(self.S, style)
-        #             w_styles = styles_def_to_tensor(w_space)
-
-        #             generated_images = self.G(w_styles, noise)
-        #             fake_output, _ = self.D_aug(generated_images, **aug_kwargs)
-        #             fake_output_loss = fake_output
-
-        #             real_output = None
-        #             if self.G_requires_reals:
-        #                 image_batch = next(self.loader).cuda(self.device)
-        #                 real_output, _ = self.D_aug(image_batch, detach = True, **aug_kwargs)
-        #                 real_output = real_output.detach()
-
-        #             if self.top_k_training:
-        #                 epochs = (self.steps * batch_size * self.gradient_accumulate_every) / len(self.dataset)
-        #                 k_frac = max(self.generator_top_k_gamma ** epochs, self.generator_top_k_frac)
-        #                 k = math.ceil(batch_size * k_frac)
-
-        #                 if k != batch_size:
-        #                     fake_output_loss, _ = fake_output_loss.topk(k=k, largest=False)
-
-        #             loss = self.G_loss_fn(fake_output_loss, real_output)
-        #             gen_loss = loss
-
-        #             if apply_path_penalty:
-        #                 pl_lengths = calc_pl_lengths(w_styles, generated_images)
-        #                 avg_pl_length = np.mean(pl_lengths.detach().cpu().numpy())
-
-        #                 if not is_empty(self.pl_mean):
-        #                     pl_loss = ((pl_lengths - self.pl_mean) ** 2).mean()
-        #                     if not torch.isnan(pl_loss):
-        #                         gen_loss = gen_loss + pl_loss
-
-        #             gen_loss = gen_loss / self.gradient_accumulate_every
-        #             gen_loss.register_hook(raise_if_nan)
-        #             backwards(gen_loss, self.GAN.G_opt, loss_id = 2)
-        #             del gen_loss
-
-        #             total_gen_loss += loss.detach().item() / self.gradient_accumulate_every
-
-        #         self.g_loss = float(total_gen_loss)
-        #         self.track(self.g_loss, 'G')
-
-        #         self.GAN.G_opt.step()
 
         # calculate moving averages
 
@@ -1151,8 +1019,9 @@ class Trainer():
                 self.evaluate(floor(self.steps / self.evaluate_every))
 
             if exists(self.calculate_fid_every) and self.steps % self.calculate_fid_every == 0 and self.steps != 0:
-                num_batches = math.ceil(self.calculate_fid_num_images / self.batch_size)
-                fid = self.calculate_fid(num_batches)
+                # num_batches = math.ceil(self.calculate_fid_num_images / self.batch_size)
+                # fid = self.calculate_fid(num_batches)
+                fid = self.calculate_fid(self.calculate_fid_num_images)
                 self.last_fid = fid
 
                 with open(str(self.results_dir / self.name / f'fid_scores.txt'), 'a') as f:
@@ -1334,7 +1203,70 @@ class Trainer():
         torchvision.utils.save_image(generated_images, str(self.results_dir / self.name / f'{str(num)}-mr.{ext}'), nrow=num_rows)
 
     @torch.no_grad()
-    def calculate_fid(self, num_batches):
+    def get_model_features(self, mode="clean", num_gen=50_000):
+        from cleanfid.resize import build_resizer
+        from cleanfid.features import build_feature_extractor
+        fn_resize = build_resizer(mode)
+        feat_model = build_feature_extractor(mode, device=self.device)
+        
+        def _resize_batch(x):
+            resized_batch = []
+            for i in range(x.shape[0]):
+                img = x[i].cpu().numpy().transpose((1, 2, 0))
+                img = fn_resize(img)
+                resized_batch.append( torch.from_numpy(img.transpose((2, 0, 1))).unsqueeze(0) )
+            return torch.cat(resized_batch, dim=0)
+        
+        latent_dim = self.GAN.G.latent_dim
+        image_size = self.GAN.G.image_size
+        num_layers = self.GAN.G.num_layers
+        
+        # generate test features
+        num_iters = int(np.ceil(num_gen / self.batch_size))
+        l_feats = []
+        
+        for idx in range(num_iters):
+            # latents and noise
+            latents = noise_list(self.batch_size, num_layers, latent_dim, device=self.device)
+            noise = image_noise(self.batch_size, image_size, device=self.device)
+
+            # moving averages
+            generated_images = self.generate_truncated(self.GAN.SE, self.GAN.GE, latents, noise, trunc_psi = self.trunc_psi)
+            if mode != "legacy_tensorflow":
+                resized_images = _resize_batch(generated_images)
+            else:
+                resized_images = generated_images
+            
+            # get_batch_features
+            feat = feat_model(resized_images).cpu().numpy()
+            l_feats.append(feat)
+            
+        return np.concatenate(l_feats)[:num_gen]
+    
+    @torch.no_grad()
+    def calculate_fid(self, num_gen=50_000, mode="clean"):
+        # from cleanfid.features import get_reference_statistics
+        print("Calculating FID...")
+        feat = self.get_model_features(mode=mode, num_gen=num_gen//self.world_size)
+        
+        if self.is_ddp:
+            np.save( str(self.fid_dir / f"feat_{self.device}.npy"), feat)
+            torch.distributed.barrier()     # wait for all processes to save their features
+            
+            for path in self.fid_dir.glob("feat_*.npy"):
+                if path.name == f"feat_{self.device}.npy":
+                    continue
+                feat = np.concatenate([feat, np.load(path)])
+                
+        
+        ref_mu, ref_sigma = cleanfid.features.get_reference_statistics(res=self.image_size, name=self.data_name, mode=mode, split="custom")
+        mu,     sigma     = np.mean(feat, axis=0), np.cov(feat, rowvar=False)
+        
+        return cleanfid.fid.frechet_distance(mu, sigma, ref_mu, ref_sigma)
+                
+    
+    @torch.no_grad()
+    def __calculate_fid(self, num_batches):
         assert self.is_main
         # from pytorch_fid import fid_score
         from cleanfid import fid
@@ -1342,20 +1274,6 @@ class Trainer():
 
         # real_path = self.fid_dir / 'real'
         fake_path = self.fid_dir / 'fake'
-
-        # remove any existing files used for fid calculation and recreate directories
-
-        # if not real_path.exists() or self.clear_fid_cache:
-        #     rmtree(real_path, ignore_errors=True)
-        #     os.makedirs(real_path)
-
-        #     for batch_num in tqdm(range(num_batches), desc='calculating FID - saving reals'):
-        #         real_batch = next(self.loader)
-        #         for k, image in enumerate(real_batch.unbind(0)):
-        #             filename = str(k + batch_num * self.batch_size)
-        #             torchvision.utils.save_image(image, str(real_path / f'{filename}.png'))
-
-        # generate a bunch of fake images in results / name / fid_fake
 
         rmtree(fake_path, ignore_errors=True)
         os.makedirs(fake_path)
