@@ -432,10 +432,10 @@ class Discriminator(nn.Module):
             num_layer = ind + 1
             is_not_last = ind != (len(chan_in_out_comm) - 1)
             
-            if not is_not_last and minibatch_type == 'stddev' and minibatch_size > 1:
-                stddev_minibatch_size = minibatch_size
-            else:
-                stddev_minibatch_size = 0
+            # if not is_not_last and minibatch_type == 'stddev' and minibatch_size > 1:
+            #     stddev_minibatch_size = minibatch_size
+            # else:
+            #     stddev_minibatch_size = 0
                 
             block = DiscriminatorBlock(in_chan, out_chan, downsample = is_not_last, 
                                        num_comm_channels=comm_chan, comm_type=comm_type)
@@ -1250,6 +1250,9 @@ class Trainer():
         feat = self.get_model_features(mode=mode, num_gen=num_gen//self.world_size)
         
         if self.is_ddp:
+            rmtree(self.fid_dir, ignore_errors=True)
+            os.mkdir(self.fid_dir)
+            
             np.save( str(self.fid_dir / f"feat_{self.device}.npy"), feat)
             torch.distributed.barrier()     # wait for all processes to save their features
             
