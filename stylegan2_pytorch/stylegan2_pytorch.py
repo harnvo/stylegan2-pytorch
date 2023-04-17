@@ -170,7 +170,10 @@ class CommBlock(nn.Module):
 class EqualLinear(nn.Module):
     def __init__(self, in_dim, out_dim, lr_mul = 1, bias = True):
         super().__init__()
-        self.weight = nn.Parameter( torch.randn(out_dim, in_dim) )
+        # self.weight = nn.Parameter( torch.randn(out_dim, in_dim) )
+        weight = torch.empty(out_dim, in_dim) 
+        torch.nn.init.kaiming_normal_(weight, mode='fan_in', nonlinearity='leaky_relu')
+        self.weight = nn.Parameter(weight / lr_mul)
         if bias:
             self.bias = nn.Parameter(torch.zeros(out_dim))
 
@@ -674,7 +677,7 @@ class Trainer():
         clear_fid_cache = False,
         is_ddp = False, device = 0, is_main = True, world_size = 1, # distributed training
         log = False,
-        audacious=False,            # this is for some audacious attempts
+        audacious=False,            # this is for some audacious attempts, will be deprecated in final version.
         *args,
         **kwargs
     ):
@@ -1019,9 +1022,10 @@ class Trainer():
                 self.evaluate(floor(self.steps / self.evaluate_every))
 
             if exists(self.calculate_fid_every) and self.steps % self.calculate_fid_every == 0 and self.steps != 0:
-                # num_batches = math.ceil(self.calculate_fid_num_images / self.batch_size)
-                # fid = self.calculate_fid(num_batches)
-                fid = self.calculate_fid(self.calculate_fid_num_images)
+                num_batches = math.ceil(self.calculate_fid_num_images / self.batch_size)
+                fid = self.calculate_fid(num_batches)
+                # fid = self.calculate_fid(self.calculate_fid_num_images)
+                
                 self.last_fid = fid
 
                 with open(str(self.results_dir / self.name / f'fid_scores.txt'), 'a') as f:
@@ -1207,7 +1211,7 @@ class Trainer():
         from cleanfid.resize import build_resizer
         from cleanfid.features import build_feature_extractor
         fn_resize = build_resizer(mode)
-        feat_model = build_feature_extractor(mode, device=self.device)
+        feat_model = build_feature_extractor(mode, device=self.device, use_dataparallel=not self.is_ddp)
         
         def _resize_batch(x):
             resized_batch = []
@@ -1215,7 +1219,7 @@ class Trainer():
                 img = x[i].cpu().numpy().transpose((1, 2, 0))
                 img = fn_resize(img)
                 resized_batch.append( torch.from_numpy(img.transpose((2, 0, 1))).unsqueeze(0) )
-            return torch.cat(resized_batch, dim=0)
+            return torch.cat(resized_batch, dim=0).to(self.device)
         
         latent_dim = self.GAN.G.latent_dim
         image_size = self.GAN.G.image_size
@@ -1238,38 +1242,41 @@ class Trainer():
                 resized_images = generated_images
             
             # get_batch_features
-            feat = feat_model(resized_images).cpu().numpy()
+            feat = feat_model(resized_images).detach().cpu().numpy()
             l_feats.append(feat)
             
         return np.concatenate(l_feats)[:num_gen]
     
-    @torch.no_grad()
-    def calculate_fid(self, num_gen=50_000, mode="clean"):
-        # from cleanfid.features import get_reference_statistics
-        print("Calculating FID...")
-        feat = self.get_model_features(mode=mode, num_gen=num_gen//self.world_size)
+    # @torch.no_grad()
+    # def calculate_fid(self, num_gen=50_000, mode="clean"):
+    #     # from cleanfid.features import get_reference_statistics
+    #     print("Calculating FID...")
+    #     feat = self.get_model_features(mode=mode, num_gen=num_gen//self.world_size)
         
-        if self.is_ddp:
-            rmtree(self.fid_dir, ignore_errors=True)
-            os.mkdir(self.fid_dir)
+    #     if self.is_ddp:
+    #         rmtree(self.fid_dir, ignore_errors=True)
+    #         os.mkdir(self.fid_dir)
             
-            np.save( str(self.fid_dir / f"feat_{self.device}.npy"), feat)
-            torch.distributed.barrier()     # wait for all processes to save their features
+    #         np.save( str(self.fid_dir / f"feat_{self.device}.npy"), feat)
+    #         print(f"Saved features to {self.fid_dir} on device {self.device}")  # for debugging
+    #         torch.distributed.barrier()     # wait for all processes to save their features
             
-            for path in self.fid_dir.glob("feat_*.npy"):
-                if path.name == f"feat_{self.device}.npy":
-                    continue
-                feat = np.concatenate([feat, np.load(path)])
+    #         for path in self.fid_dir.glob("feat_*.npy"):
+    #             if path.name == f"feat_{self.device}.npy":
+    #                 continue
+    #             feat = np.concatenate([feat, np.load(path)])
                 
-        
-        ref_mu, ref_sigma = cleanfid.features.get_reference_statistics(res=self.image_size, name=self.data_name, mode=mode, split="custom")
-        mu,     sigma     = np.mean(feat, axis=0), np.cov(feat, rowvar=False)
-        
-        return cleanfid.fid.frechet_distance(mu, sigma, ref_mu, ref_sigma)
+            
+    #     if self.is_main:    
+    #         ref_mu, ref_sigma = cleanfid.features.get_reference_statistics(res=self.image_size, name=self.data_name, mode=mode, split="custom")
+    #         mu,     sigma     = np.mean(feat, axis=0), np.cov(feat, rowvar=False)
+    #         return cleanfid.fid.frechet_distance(mu, sigma, ref_mu, ref_sigma)
+    #     else:
+    #         return None
                 
     
     @torch.no_grad()
-    def __calculate_fid(self, num_batches):
+    def calculate_fid(self, num_batches):
         assert self.is_main
         # from pytorch_fid import fid_score
         from cleanfid import fid
@@ -1490,7 +1497,7 @@ if __name__ == '__main__':
     # out = mb(x)
     # print(mb.get_out_features())
     
-    mb = MiniBatchStdDev()
+    mb = MinibatchStd(group_size=4)
     x  = torch.randn(32, 124, 4, 4)
     out = mb(x)
     print(out.shape)

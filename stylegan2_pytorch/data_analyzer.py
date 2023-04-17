@@ -28,7 +28,7 @@ class Analyzer():
         num_packs=1,            # number of packs.                  For discriminator only.
         minibatch_size=1,       # minibatch size.                   For discriminator only.
         minibatch_type='original', # minibatch type.                For discriminator only.
-        mbstd_num_channels = 0  # for minibatchstd
+        mbstd_num_channels = 0,  # for minibatchstd
         batch_size = 4,
         num_workers = None,
         num_image_tiles = 8,
@@ -74,6 +74,8 @@ class Analyzer():
         self.comm_capacity = comm_capacity
         self.num_packs = num_packs
         self.minibatch_size = minibatch_size
+        self.minibatch_type = minibatch_type
+        self.mbstd_num_channels = mbstd_num_channels
 
 
         self.fq_layers = cast_list(fq_layers)
@@ -114,6 +116,7 @@ class Analyzer():
 
         self.load_config()
         self.data_dir = data_dir
+        self.data_name = data_dir.split('/')[-1]
         self.fid_stats_path = fid_stats_path
         # self.set_data_src(data_dir)
 
@@ -141,7 +144,7 @@ class Analyzer():
             fmap_max = self.fmap_max, transparent = self.transparent, comm_capacity=self.comm_capacity, num_packs= self.num_packs, 
             minibatch_size=self.minibatch_size, minibatch_type = self.minibatch_type, mbstd_num_channels = self.mbstd_num_channels,
             fq_layers = self.fq_layers, fq_dict_size = self.fq_dict_size, attn_layers = self.attn_layers, 
-            fp16 = self.fp16, cl_reg = self.cl_reg, no_const = self.no_const, rank = self.rank, 
+            fp16 = self.fp16, cl_reg = self.cl_reg, no_const = self.no_const, device = self.rank, 
             *args, **kwargs)
 
         # if self.is_ddp:
@@ -273,7 +276,7 @@ class Analyzer():
 
     @torch.no_grad()
     def calculate_fid(self, num_batches):
-        
+        from cleanfid import fid
         torch.cuda.empty_cache()
 
         fake_path = self.fid_dir / 'fake'
@@ -300,20 +303,27 @@ class Analyzer():
 
             for j, image in enumerate(generated_images.unbind(0)):
                 torchvision.utils.save_image(image, str(fake_path / f'{str(j + batch_num * self.batch_size)}.{ext}'))
-
-        with np.load(self.fid_stats_path) as f:
-            m1, s1 = f['mu'][:], f['sigma'][:]
+        
             
-        dims = 2048
-        block_idx = fid_score.InceptionV3.BLOCK_INDEX_BY_DIM[dims]
-        model = fid_score.InceptionV3([block_idx]).to(self.rank)
+        return fid.compute_fid(str(fake_path), dataset_name = self.data_name, mode = 'clean' , dataset_split="custom")
         
-        m2, s2 = fid_score.compute_statistics_of_path(str(fake_path), model, self.batch_size, dims, self.rank)
+        # return fid.compute_fid(str(fake_path), dataset_name = self.data_name, mode = 'clean' , dataset_split="custom", \
+        #                        use_dataparallel = not self.is_ddp, verbose = False, device = self.device, num_workers = 0)
+
+        # with np.load(self.fid_stats_path) as f:
+        #     m1, s1 = f['mu'][:], f['sigma'][:]
+            
+        # dims = 2048
+        # block_idx = fid_score.InceptionV3.BLOCK_INDEX_BY_DIM[dims]
+        # model = fid_score.InceptionV3([block_idx]).to(self.rank)
         
-        return fid_score.calculate_frechet_distance(m1, s1, m2, s2)
+        # m2, s2 = fid_score.compute_statistics_of_path(str(fake_path), model, self.batch_size, dims, self.rank)
+        
+        # return fid_score.calculate_frechet_distance(m1, s1, m2, s2)
 
     @torch.no_grad()
     def calculate_intra_fid(self):
+        from cleanfid import fid
         # this function is called fater calculate_fid, so we can assume that the fake images are already generated
         fake_path = self.fid_dir / 'fake'
         # list the num of fake images using glob
@@ -351,7 +361,8 @@ class Analyzer():
             for j, image in enumerate(generated_images.unbind(0)):
                 torchvision.utils.save_image(image, str(fake_path1 / f'{str(j + batch_num * self.batch_size)}.{ext}'))
                 
-        return fid_score.calculate_fid_given_paths([str(fake_path), str(fake_path1)], self.batch_size, self.rank, 2048)
+        # return fid_score.calculate_fid_given_paths([str(fake_path), str(fake_path1)], self.batch_size, self.rank, 2048)
+        return fid.compute_fid(fdir1 = str(fake_path), fdir2 = str(fake_path1), mode='clean')
         
     @torch.no_grad()
     def truncate_style(self, tensor, S, trunc_psi = 0.75):
@@ -472,6 +483,7 @@ if __name__ == '__main__':
     parser.add_argument('--num_workers', type=int, default=None)
     parser.add_argument('--trunc_psi', type=float, default=0.75)
     parser.add_argument('--rank', type=int, default=1)
+    parser.add_argument('--num_rep', type=int, default=10)
 
     arg = parser.parse_args()
     
@@ -495,13 +507,12 @@ if __name__ == '__main__':
         
     analyzer.save_fid_stat_for_data(batch_size=512)
     
-    with open('./results.csv', 'a') as f:
+    with open('./results_rep=5.csv', 'a') as f:
         f.write('names, fid, fid_std, intra_fid, intra_fid_std \n')
 
     for name in arg.names:
         analyzer = Analyzer(
             name=name,
-            
             data_dir=arg.data_dir,
             models_dir=arg.models_dir,
             fid_stats_path=arg.fid_stats_path,
@@ -509,14 +520,14 @@ if __name__ == '__main__':
             calculate_fid_num_images = arg.calculate_fid_num_images,
             log = arg.log,
             num_workers = arg.num_workers,
-            # trunc_psi=arg.trunc_psi,
+            trunc_psi=arg.trunc_psi,
             rank=arg.rank,
             clear_fid_cache=True
         )
         
-        fid, fid_std, intra_fid, intra_fid_std = analyzer.analyse_fid(num_repetitions=20)
+        fid, fid_std, intra_fid, intra_fid_std = analyzer.analyse_fid(num_repetitions=arg.num_rep)
         
-        with open('./results.csv', 'a') as f:
+        with open('./results_rep=5.csv', 'a') as f:
             f.write(f'{name}, {fid}, {fid_std}, {intra_fid}, {intra_fid_std} \n')
 
      
